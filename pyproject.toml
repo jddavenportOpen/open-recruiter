@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openrecruiter"
+version = "0.1.0"
+description = "A recruiter that lives on your computer and texts your phone."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+keywords = ["job-search", "resume", "ats", "agent", "claude"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Office/Business",
+]
+# No runtime dependencies, deliberately. The engine is stdlib-only so it runs in
+# CI, in a cron job, and on a stranger's laptop with no install step. If you are
+# about to add one here, check whether it belongs in an extra instead.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+openrecruiter = "openrecruiter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["openrecruiter*"]
