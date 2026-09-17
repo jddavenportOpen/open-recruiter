@@ -104,6 +104,158 @@ def channels(_args) -> int:
     return 0
 
 
+def intake(args) -> int:
+    """Build the experience bank from resumes the user already has."""
+    from openrecruiter import intake as I, wire
+    folder = os.path.abspath(os.path.expanduser(args.folder))
+    print(f"\nreading {folder}\n")
+    paths = I.discover_resumes(folder)
+    if not paths:
+        print("  no resume-shaped files found there.")
+        return 1
+    extractions, low = [], []
+    for path in paths:
+        got = I.extract(path)
+        level = str(got.get("level") or "").upper()
+        conf = got.get("confidence")
+        name = os.path.basename(path)
+        label = {"HIGH": "ok  ", "LOW": "weak", "UNREADABLE": "bad "}.get(level, "weak")
+        pct = f"{float(conf):.0%}" if isinstance(conf, (int, float)) else "?"
+        print(f"  {label} {name}  ({pct})")
+        for w in got.get("warnings") or []:
+            print(f"         {w}")
+        if level != "HIGH":
+            low.append(f"{name} ({level.lower() or 'unknown'})")
+        extractions.append(got)
+    bank = I.merge_to_bank(extractions)
+    path = wire.save_bank(bank)
+    print(f"\nbank written to {path}")
+    gaps = bank.get("_gaps") or []
+    if gaps:
+        # Printed, never silently absorbed: a bank that is missing something and
+        # does not say so is how invented facts get in later.
+        print("\ngaps it could NOT fill honestly (fix these by hand):")
+        for g in gaps:
+            if isinstance(g, dict):
+                print(f"  - {g.get('field','?')}: {g.get('why','')}")
+            else:
+                print(f"  - {g}")
+    conflicts = bank.get("_conflicts") or []
+    if conflicts:
+        # Two of your own resumes disagree about a number. Nobody picks a winner
+        # for you -- that is the drift this tool exists to make visible.
+        print("\nyour sources DISAGREE (no winner was chosen for you):")
+        for c in conflicts[:10]:
+            print(f"  - {c}")
+    if low:
+        print(f"\n{len(low)} file(s) read poorly. Check them before trusting the bank:")
+        for n in low:
+            print(f"  - {n}")
+    print("\nNext: `openrecruiter setup`")
+    return 0
+
+
+def setup(args) -> int:
+    """Interview, then propose a pipeline the user confirms."""
+    from openrecruiter import interview as V, store as S, wire
+    import json as _json
+    bank = wire.load_bank()
+    store = S.Store()
+    answers = {}
+    print("\nA few questions. Press enter to skip any of them.\n")
+    for q in V.QUESTIONS:
+        try:
+            got = input(f"  {q.prompt}\n  > ").strip()
+        except EOFError:
+            got = ""
+        if got:
+            answers[q.key] = got
+        print()
+    goals = V.build_goals(answers)
+    store.save_goals(goals)
+    proposal = V.propose_pipeline(goals, bank)
+    for w in proposal.get("warnings") or []:
+        print(f"  note: {w}\n")
+
+    proposal["boards"] = wire.boards_from_proposal(proposal)
+    reasons = proposal.get("reasons") or {}
+    print("Proposed pipeline. Every board token below is a GUESS from the company")
+    print("name — check them before you scan.\n")
+    for row in proposal["boards"]:
+        why = reasons.get(f"company:{row['name']}", "")
+        print(f"  {row['name']:22} {row['ats']:11} token={row['token']:18} {why[:54]}")
+
+    path = os.path.join(wire.home(), "pipeline.json")
+    with open(path, "w") as fh:
+        _json.dump(proposal, fh, indent=1)
+    print(f"\nwritten to {path}")
+    print("\nThis is yours to edit — add companies, fix a token, delete what you do")
+    print("not want. Nothing here was chosen for you.")
+    print("Then: `openrecruiter scan`")
+    return 0
+
+
+def scan(args) -> int:
+    from openrecruiter import store as S, wire
+    import json as _json
+    path = os.path.join(wire.home(), "pipeline.json")
+    if not os.path.exists(path):
+        print("no pipeline yet — run `openrecruiter setup`")
+        return 1
+    with open(path) as fh:
+        pipeline = _json.load(fh)
+    res = wire.scan(S.Store(), pipeline)
+    print(f"\n  {res['found']} postings seen, {res['added']} new")
+    for f in res.get("failures") or []:
+        # A board that is down is NOT an empty market. Always surfaced.
+        print(f"  FAILED: {f}")
+    if res.get("note"):
+        print(f"  {res['note']}")
+    return 0
+
+
+def run(args) -> int:
+    from openrecruiter import store as S, wire
+    from openrecruiter.loop import run_forever, run_once
+    store = S.Store()
+    bank = wire.load_bank()
+    deps = wire.build_deps(store, bank)
+    print(f"\nrunning. stop with: touch {os.path.join(wire.home(), 'STOP')}\n")
+    if args.once:
+        print(run_once(store, deps))
+        return 0
+    run_forever(store, deps)
+    return 0
+
+
+def outcomes(args) -> int:
+    from openrecruiter import store as S
+    store = S.Store()
+    if args.record:
+        app_id, result = args.record
+        store.record_outcome(app_id, result)
+        print(f"recorded {app_id}: {result}")
+        return 0
+    rep = store.score_vs_outcome()
+    if not rep:
+        print("\nNo outcomes recorded yet. That is the honest state, not an error —\n"
+              "the question 'does the score predict anything?' needs data first.\n")
+        return 0
+    print(f"\n  {'outcome':16} {'n':>4} {'mean score':>11} {'mean days':>10}")
+    for k, v in sorted(rep.items()):
+        print(f"  {k:16} {v['n']:>4} {str(v['mean_score'] or '-'):>11} "
+              f"{str(v['mean_days'] or '-'):>10}")
+    total = sum(v["n"] for v in rep.values())
+    if total < 30:
+        print(f"\n  n={total}. Too few to conclude anything. Reported, not interpreted.")
+    return 0
+
+
+def serve(args) -> int:
+    from openrecruiter import dashboard
+    return dashboard.serve(port=args.port)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="openrecruiter",
                                 description="A recruiter that lives on your computer.")
@@ -111,6 +263,26 @@ def main(argv=None) -> int:
     sub.add_parser("doctor", help="what is configured, what is missing").set_defaults(fn=doctor)
     sub.add_parser("selftest", help="run the invariant suite + mutation check").set_defaults(fn=selftest)
     sub.add_parser("channels", help="show configured messaging rails").set_defaults(fn=channels)
+
+    p_in = sub.add_parser("intake", help="build your experience bank from resumes you have")
+    p_in.add_argument("folder", help="a folder containing your existing resumes")
+    p_in.set_defaults(fn=intake)
+
+    sub.add_parser("setup", help="interview, then propose a pipeline you confirm").set_defaults(fn=setup)
+    sub.add_parser("scan", help="pull the configured boards for new postings").set_defaults(fn=scan)
+
+    p_run = sub.add_parser("run", help="work the queue, one application at a time")
+    p_run.add_argument("--once", action="store_true", help="a single cycle, then stop")
+    p_run.set_defaults(fn=run)
+
+    p_out = sub.add_parser("outcomes", help="what happened, and whether the score predicted it")
+    p_out.add_argument("--record", nargs=2, metavar=("APP_ID", "RESULT"),
+                       help="rejected|screen|interview|offer|hired|no_response|withdrawn")
+    p_out.set_defaults(fn=outcomes)
+
+    p_srv = sub.add_parser("dashboard", help="the localhost dashboard")
+    p_srv.add_argument("--port", type=int, default=8765)
+    p_srv.set_defaults(fn=serve)
     a = p.parse_args(argv)
     if not getattr(a, "fn", None):
         p.print_help()
