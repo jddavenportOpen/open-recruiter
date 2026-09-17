@@ -99,7 +99,17 @@ _MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
 _TERM = rf"(?:(?:{_MONTH}\s*|\d{{1,2}}[/\-])?(?:19|20)\d{{2}}|present|current|now)"
 DATE_RANGE_RE = re.compile(rf"{_TERM}\s*(?:to|through|[-–—])\s*{_TERM}", re.I)
 
-_BULLET_RE = re.compile(r"^\s*[•▪◦·*•▪–—\-]\s+")
+# Real resumes are typeset by real word processors, and each one picks its own
+# bullet glyph. This class was missing U+25CF BLACK CIRCLE, which is what Google
+# Docs and Word emit by default -- so a resume whose every bullet begins with it
+# parsed as SEVEN JOB HEADERS AND ZERO BULLETS, and said so honestly while being
+# useless. A glyph we do not know is not a line we should drop.
+_BULLET_RE = re.compile(
+    "^\\s*["
+    "\u2022\u25cf\u25cb\u25aa\u25ab\u25e6\u2023\u2043\u2219\u00b7"   # bullet, circles, squares, hyphen-bullet
+    "\u25b6\u25ba\u2756\u273f\u2794\u27a2\u00bb"                       # arrows/ornaments some templates use
+    "*\u2013\u2014\\-"                                                    # asterisk, en/em dash, hyphen
+    "]\\s+")
 # Two fields on one line are separated by a pipe, a dash with space around it, or
 # a tab. NOT by a comma: "Portland, OR" would split into nonsense.
 _PIECE_SPLIT_RE = re.compile(r"\s*(?:\||\t|\s[–—-]\s)\s*")
@@ -226,6 +236,44 @@ def extract(path: str) -> dict:
     rec["level"] = HIGH if all(signals[k] for k in SIGNAL_WEIGHTS) else LOW
     rec["usable"] = True
     return rec
+
+
+# A bullet glyph appearing MID-LINE is a line break the PDF lost. Two-column and
+# tightly-kerned resumes routinely extract as one long line carrying a job header
+# and then every bullet under it, separated only by the glyph. Without this, those
+# bullets are invisible: the line does not START with a bullet, so it is not a
+# bullet, and it is too long to be a header -- it lands in `unused` and the job
+# comes out with nothing under it. Measured on four real resumes: 9 bullets
+# recovered before this, 1 of 7 jobs populated.
+_INLINE_BULLET_RE = re.compile(
+    "\\s+["
+    "\u2022\u25cf\u25cb\u25aa\u25ab\u25e6\u2023\u2043\u2219"
+    "\u25b6\u25ba\u2756\u273f\u2794\u27a2"
+    "]\\s+")
+
+
+def _explode_inline_bullets(lines: list) -> list:
+    """Split any line that carries bullet glyphs inside it.
+
+    Only fires when the glyph is unambiguous -- a hyphen or asterisk is NOT in
+    the inline set, because "cost-benefit" and "5 * 3" are ordinary text. A
+    leading fragment before the first glyph is kept as its own line so a job
+    header glued to its first bullet still reaches the header detector.
+    """
+    out = []
+    for ln in lines:
+        if not _INLINE_BULLET_RE.search(ln):
+            out.append(ln)
+            continue
+        parts = _INLINE_BULLET_RE.split(ln)
+        head = parts[0].strip()
+        if head:
+            out.append(head)
+        for piece in parts[1:]:
+            piece = piece.strip(" |")
+            if piece:
+                out.append("\u2022 " + piece)
+    return out
 
 
 def _normalize(text: str) -> str:
@@ -495,7 +543,7 @@ def _merge_education(parsed, bank, gaps):
 def _parse_source(text: str) -> dict:
     doc = {"contact": {}, "summary": None, "skills": [], "education": [],
            "jobs": [], "unused": []}
-    lines = [ln.strip() for ln in text.splitlines()]
+    lines = _explode_inline_bullets([ln.strip() for ln in text.splitlines()])
     section = None
     summary_lines: list[str] = []
     candidates: list[str] = []      # non-bullet lines that may head the next job

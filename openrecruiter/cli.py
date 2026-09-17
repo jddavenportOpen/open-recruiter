@@ -256,6 +256,64 @@ def serve(args) -> int:
     return dashboard.serve(port=args.port)
 
 
+def import_bank(args) -> int:
+    """Adopt an experience bank you already have, instead of re-deriving one.
+
+    Parsing a styled PDF back into structured history is lossy, and a bank you
+    have already curated is better than one this tool re-guessed. If you have a
+    structured resume from anywhere -- recruit-copilot, your own JSON, a previous
+    run -- this takes it, checks it, and tells you what it holds rather than
+    assuming it is fine.
+    """
+    from openrecruiter import wire
+    import json as _json
+    src = os.path.abspath(os.path.expanduser(args.path))
+    try:
+        with open(src) as fh:
+            bank = _json.load(fh)
+    except Exception as e:
+        print(f"could not read {src}: {e}")
+        return 1
+    if not isinstance(bank, dict):
+        print(f"{src} is not a bank object")
+        return 1
+
+    jobs = bank.get("jobs") or []
+    def _n(j):
+        b = j.get("bullets") or {}
+        return len(b) if isinstance(b, dict) else len(b)
+    bullets = sum(_n(j) for j in jobs)
+    contact = bank.get("contact") or {}
+    name = bank.get("name") or contact.get("name") or ""
+
+    problems = []
+    if not name:
+        problems.append("no name (top-level `name` or `contact.name`)")
+    if not contact.get("email"):
+        problems.append("no email in `contact`")
+    if not jobs:
+        problems.append("no jobs")
+    if not bullets:
+        problems.append("no bullets under any job")
+
+    print(f"\n  name    : {name or '(missing)'}")
+    print(f"  email   : {contact.get('email') or '(missing)'}")
+    print(f"  jobs    : {len(jobs)}")
+    print(f"  bullets : {bullets}")
+    print(f"  summaries: {len(bank.get('summaries') or {})}")
+    if problems:
+        # Refused, not imported-with-a-warning: a bank missing these produces a
+        # resume missing them too, and that is discovered at the worst moment.
+        print("\n  REFUSED — this bank cannot build a resume:")
+        for x in problems:
+            print(f"    - {x}")
+        return 1
+    path = wire.save_bank(bank)
+    print(f"\n  imported to {path}")
+    print("\nNext: `openrecruiter setup`")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="openrecruiter",
                                 description="A recruiter that lives on your computer.")
@@ -267,6 +325,10 @@ def main(argv=None) -> int:
     p_in = sub.add_parser("intake", help="build your experience bank from resumes you have")
     p_in.add_argument("folder", help="a folder containing your existing resumes")
     p_in.set_defaults(fn=intake)
+
+    p_imp = sub.add_parser("import", help="adopt an experience bank you already have")
+    p_imp.add_argument("path", help="a bank JSON file")
+    p_imp.set_defaults(fn=import_bank)
 
     sub.add_parser("setup", help="interview, then propose a pipeline you confirm").set_defaults(fn=setup)
     sub.add_parser("scan", help="pull the configured boards for new postings").set_defaults(fn=scan)
