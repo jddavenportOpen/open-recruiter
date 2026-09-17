@@ -1,4 +1,10 @@
 """Messaging transports. The loop talks to `Channel`, never to an adapter."""
+# Required for the `dict | None` annotation below on Python 3.9, which is what
+# stock macOS ships. Without it a brand-new user cloning this repo gets
+# `TypeError: unsupported operand type(s) for |` from inside an import, which
+# names neither the cause nor the fix.
+from __future__ import annotations
+
 import os
 
 from .base import Capabilities, Card, Channel, Decision, parse_reply  # noqa: F401

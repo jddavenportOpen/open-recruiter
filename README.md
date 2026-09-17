@@ -100,6 +100,10 @@ failure presents as a hang rather than an error.)
 
 ## Install
 
+**You need Python 3.10 or newer.** macOS still ships 3.9, so on a fresh Mac:
+`brew install python@3.12` and use `python3.12` below. The tool says so plainly
+rather than failing inside an import.
+
 ```bash
 git clone https://github.com/jddavenportOpen/open-recruiter.git
 cd open-recruiter
@@ -107,8 +111,20 @@ python3 -m openrecruiter.cli doctor      # says exactly what is missing
 python3 -m openrecruiter.cli selftest    # invariant suite + mutation check, offline
 ```
 
-No install step, no dependencies. The engine is stdlib-only by policy so it runs
-in CI, in a cron job, and on a laptop you have not configured.
+No install step and no dependencies beyond Python itself. The engine is
+stdlib-only by policy, so it runs in CI, in a cron job, and on a laptop you have
+not configured.
+
+### If you already have a structured resume
+
+Parsing a styled PDF back into structured history is lossy, and this tool is
+honest about that (see **Known limits**). If you already have a bank — from
+[recruit-copilot](https://github.com/jddavenportOpen/recruit-copilot), a previous
+run, or your own JSON — adopt it instead:
+
+```bash
+python3 -m openrecruiter.cli import path/to/bank.json
+```
 
 ### Messaging
 
@@ -162,6 +178,22 @@ a resume scoring zero on every dimension came back as a pass. Anything wired to
 that verdict would have been submitting on three booleans.
 
 ---
+
+## Known limits
+
+**Intake on styled PDFs is weak.** Run against four real two-column resumes it
+produced seven job headers and *zero* bullets, because the bullet glyph is often
+dropped at extraction entirely. Widening the glyph set and splitting inline
+bullets helped and neither was sufficient; an indent-based heuristic was tried,
+did not move the number, and was reverted rather than left in looking useful.
+Every file still reported itself read at 100%, which is the part that stings.
+
+So: check what `intake` produces before trusting it, and prefer `import` when you
+already have a curated bank. A plain-text resume parses far better than a
+designed one.
+
+**No results data.** The outcome ledger starts at zero and the tool says so
+rather than borrowing anyone else's numbers.
 
 ## Roadmap
 
