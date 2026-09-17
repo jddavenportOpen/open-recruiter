@@ -2,6 +2,10 @@
 
 *A recruiter that lives on your computer and texts your phone.*
 
+> **Not a developer?** → **[START-HERE.md](START-HERE.md)** is the plain-English
+> setup, about 15 minutes, no experience assumed. It includes a prompt you can
+> paste into Claude Code to have it do the whole thing for you.
+
 It learns what job you want by talking to you, builds the pipelines to find those
 jobs, tailors a resume per posting, proves a machine can still read it — then
 **asks you before it applies, one application at a time.**
