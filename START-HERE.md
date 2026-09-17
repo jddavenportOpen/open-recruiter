@@ -133,9 +133,22 @@ python3 -m openrecruiter.cli intake ~/Documents/my-resumes
 ```
 
 It will tell you what it could and could not read. **Read that output.** If it
-says a file was read poorly, or that it found no bullet points, believe it — see
-*Known limits* in the README. Plain-text or simply-formatted resumes work much
-better than heavily designed ones.
+says a file was read poorly, or that it found no bullet points, believe it.
+
+> ### The single biggest thing you can do here
+>
+> **If your resume lives in Google Docs, do not give it a PDF.** In Google Docs
+> choose **File → Download → Plain Text (.txt)** and put that in the folder
+> instead.
+>
+> A designed, two-column PDF is a picture of a resume with the text scattered
+> around it. Half the time the bullet characters are not even in the file — they
+> are in a font that comes back as nothing — and everything under a job heading
+> vanishes. A `.txt` export has none of that problem and parses close to
+> perfectly. Same words, one menu click, enormously better result.
+>
+> Microsoft Word: **File → Save As → Plain Text**. Pages: **File → Export To →
+> Plain Text**.
 
 ### 6. Tell it what you want
 

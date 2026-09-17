@@ -208,9 +208,15 @@ bullets helped and neither was sufficient; an indent-based heuristic was tried,
 did not move the number, and was reverted rather than left in looking useful.
 Every file still reported itself read at 100%, which is the part that stings.
 
-So: check what `intake` produces before trusting it, and prefer `import` when you
-already have a curated bank. A plain-text resume parses far better than a
-designed one.
+**The fix is free and takes one click**: export your resume as plain text
+(Google Docs → File → Download → Plain Text; Word → Save As → Plain Text) and
+hand `intake` that instead. A designed PDF is a picture of a resume with the
+text scattered around it, and the bullet glyph is frequently in a symbol font
+that extracts as nothing. A `.txt` export of the same document parses close to
+perfectly.
+
+Check what `intake` produces before trusting it, and prefer `import` when you
+already have a curated bank.
 
 **No results data.** The outcome ledger starts at zero and the tool says so
 rather than borrowing anyone else's numbers.
