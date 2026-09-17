@@ -107,7 +107,47 @@ class Clock:
         self.t += s
 
 
+class CycleSpy:
+    """A per-cycle snapshot of "did anything actually happen".
+
+    `run_once` reads the quota exactly once, before it picks anything, so this
+    doubles as a hook at the top of every cycle. Each mark records how many
+    events the store has written and how many times the loop has slept, both as
+    of that moment -- so consecutive marks say whether the cycle between them
+    moved a row or cost any time.
+    """
+
+    def __init__(self, store, clock, windows=HEALTHY):
+        self.store, self.clock, self.windows = store, clock, windows
+        self.marks = []
+
+    def events(self):
+        return self.store.db.execute("SELECT COUNT(*) n FROM events").fetchone()["n"]
+
+    def quota_reader(self):
+        self.marks.append((self.events(), len(self.clock.slept)))
+        return self.windows
+
+
 class LoopCase(unittest.TestCase):
+    def assert_no_hot_spin(self, spy):
+        """Every cycle either moved a row or cost real time.
+
+        A cycle that does neither is a fixed point: the next one reads the same
+        rows and reaches the same conclusion, immediately, forever. The cost is
+        not the wasted CPU -- it is that each lap calls `deps.quota_reader()`,
+        which in production shells a real CLI run and burns the very budget the
+        pacer exists to protect.
+        """
+        self.assertGreater(len(spy.marks), 1, "the spy saw fewer than two cycles")
+        for i in range(1, len(spy.marks)):
+            moved = spy.marks[i][0] != spy.marks[i - 1][0]
+            slept = spy.marks[i][1] != spy.marks[i - 1][1]
+            self.assertTrue(
+                moved or slept,
+                f"cycle {i} changed nothing in the store and slept for nothing -- "
+                "a fixed point spinning on deps.quota_reader()")
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="orloop-")
         self.store = Store(os.path.join(self.tmp, "s.db"))
@@ -270,6 +310,27 @@ class BlipAndWallAreOpposites(unittest.TestCase):
                   "529 overloaded_error — does not count against your usage limit"):
             self.assertEqual(quota.classify_failure(t), quota.SERVER_BLIP, t)
 
+    def test_the_disclaimer_is_checked_BEFORE_the_wall_keywords(self):
+        """Presence is not order, and only order is load-bearing here.
+
+        Deleting the disclaimer tier is caught. DEMOTING it -- one swap, nothing
+        removed, `_WALL` tested first -- passed all 490 tests, because every
+        other fixture in this file carries exactly one signal and so classifies
+        the same in either order. A message needs BOTH to tell the orders apart,
+        and the real one does: Anthropic's overload copy names the limit it is
+        disclaiming. Under the inversion this transient 529 becomes a plan wall
+        and parks the runner until a reset that was never coming.
+        """
+        both = ("API Error 529 overloaded_error: this error is unrelated to your "
+                "usage limit and does not affect your weekly limit")
+        self.assertTrue(any(w in both for w in quota._WALL),
+                        "the fixture lost its wall keyword -- it would now pass in "
+                        "either order and guard nothing")
+        self.assertTrue(any(d in both for d in quota._BLIP_DISCLAIMERS),
+                        "the fixture lost its disclaimer")
+        self.assertEqual(quota.classify_failure(both), quota.SERVER_BLIP,
+                         "the wall keywords were checked before the disclaimer")
+
     def test_a_wall_delivered_as_429_is_still_a_wall(self):
         """429 is also a blip code. If the code wins, every wall gets hammered."""
         self.assertEqual(
@@ -406,6 +467,52 @@ class TheGateStandsBetweenTheResumeAndTheHuman(LoopCase):
         r = loop.run_once(self.store, d, now=time.time())
         self.assertIs(r.outcome, loop.Outcome.FAILED)
         self.assertEqual(self.rec.asks, [])
+
+    def test_the_build_result_does_not_get_to_say_who_the_employer_is(self):
+        """panel.is_reach() keys the ENTIRE bar off the company string, so a
+        builder that names its own employer picks its own pass mark.
+
+        The row is Anthropic at panel 85 / raw 72: it clears the standard bar
+        (70/68) and fails the reach one (90/80 plus two votes). Filling company
+        with setdefault made this depend on whether the builder stayed silent --
+        omitting it gave below_bar, sending "" or "Acme" gave a card and a
+        submitted application. The company is read from the row now, so all
+        three behave the same.
+        """
+        for sent in (None, "", "Acme", "a0", "Definitely Not Anthropic"):
+            with self.subTest(company_sent_by_builder=sent):
+                store = Store(os.path.join(self.tmp, f"gate-{sent!r}.db"))
+                self.addCleanup(store.close)
+                store.upsert_discovered("a0", "Anthropic", "Principal PM",
+                                        "https://example.com/0", tier="standard")
+
+                def build(app, sent=sent):
+                    out = build_result(score=72)
+                    if sent is not None:
+                        out["panel"]["company"] = sent
+                    return out
+
+                d = self.deps(Recorder(build=build))
+                r = loop.run_once(store, d, now=time.time())
+                self.assertIs(r.outcome, loop.Outcome.BELOW_BAR)
+                self.assertEqual(self.rec.asks, [],
+                                 "the build result named its own employer and got a card")
+                self.assertEqual(self.rec.submits, [])
+                self.assertEqual(store.get("a0").state, State.BELOW_BAR)
+
+    def test_the_build_result_cannot_declare_its_way_down_to_the_standard_bar(self):
+        """Two independent reads of the tier, and the stricter wins.
+
+        The row says reach; the build result says standard. Score 80 clears the
+        standard bar and not the reach one, so letting the build result's own
+        label win is the same hole as naming its own employer -- a mislabelled
+        tier must not be a way past this.
+        """
+        self.seed(1, tier="reach", company="Not In The List Inc")
+        d = self.deps(Recorder(build=lambda app: build_result(score=80, tier="standard")))
+        r = loop.run_once(self.store, d, now=time.time())
+        self.assertIs(r.outcome, loop.Outcome.BELOW_BAR)
+        self.assertEqual(self.rec.asks, [], "a reach row was judged at the standard bar")
 
     def test_a_card_with_no_reason_and_no_claims_is_refused(self):
         """A card that is a filename and a number turns reading into clicking."""
@@ -639,6 +746,89 @@ class PacingAgainstRealQuota(LoopCase):
         c = Clock()
         loop.run_forever(self.store, d, clock=c, sleeper=c.sleep, max_cycles=6)
         self.assertEqual(len(rec.builds), 2, "a failing build was retried forever")
+
+
+class ACycleEitherMovesARowOrCostsTime(LoopCase):
+    """Fixed points. `run_forever` paced HALTED, PAUSED and IDLE and nothing
+    else, so every other non-advancing outcome fell through to a `min_gap_s`
+    that is 0.0 by default -- an unpaced `while True` around the quota reader."""
+
+    def test_an_unanswered_card_is_bounded_and_does_not_block_the_queue(self):
+        """AMBIGUOUS moves nothing, and the row it does not move sits at the
+        head of the queue.
+
+        Measured before the fix: 40 cycles, 40 asks of the same card, 40 quota
+        reads, zero sleeps, and the second application never built at all.
+        """
+        self.seed(2)
+        c = Clock()
+        spy = CycleSpy(self.store, c)
+        rec = Recorder(ask=Decision.AMBIGUOUS)
+        d = self.deps(rec, quota_reader=spy.quota_reader, max_reasks=3)
+        loop.run_forever(self.store, d, clock=c, sleeper=c.sleep, max_cycles=40)
+
+        self.assertEqual(len(rec.asks), 6,
+                         "the same unanswered card was re-asked every cycle")
+        self.assertEqual(sorted(set(rec.builds)), ["a0", "a1"],
+                         "an unanswered card blocked every other application")
+        self.assertEqual(rec.submits, [], "an unclear answer was acted on")
+        self.assertEqual(self.store.stats().get("expired"), 2,
+                         "the parked cards did not end somewhere they can be re-asked")
+        self.assertNotIn(State.APPROVED.value, self.store.stats())
+        self.assert_no_hot_spin(spy)
+
+    def test_a_stranded_yes_is_parked_rather_than_spun_on(self):
+        """A yes too old to act on cannot be submitted and cannot be re-asked
+        while it sits in APPROVED, so it is a permanent fixed point.
+
+        Measured before the fix: 50 cycles, 50 STALE_APPROVAL results, 50 quota
+        reads, zero sleeps, the row still APPROVED at the end.
+        """
+        now = time.time()
+        self.seed(1)
+        self.store.transition("a0", State.BUILDING, "build")
+        self.store.transition("a0", State.AWAITING_APPROVAL, "gate", score=88, raw_score=88)
+        self.store.transition("a0", State.APPROVED, "yes", approved_at=now - 3 * 86400)
+
+        c = Clock(now)
+        spy = CycleSpy(self.store, c)
+        rec = Recorder()
+        d = self.deps(rec, quota_reader=spy.quota_reader, consent_max_age_s=86400)
+        rep = loop.run_forever(self.store, d, clock=c, sleeper=c.sleep, max_cycles=50)
+
+        outcomes = [r.outcome for r in rep.results]
+        self.assertEqual(outcomes.count(loop.Outcome.STALE_APPROVAL), 1,
+                         "the same stranded yes was reported on every cycle")
+        self.assertEqual(self.store.get("a0").state, State.EXPIRED,
+                         "the stale approval stayed a fixed point in APPROVED")
+        self.assertEqual(rec.submits, [], "a stale yes was submitted")
+        self.assert_no_hot_spin(spy)
+
+    def test_parking_a_card_leaves_the_question_open_and_never_answers_it(self):
+        """Both fixes park a row in EXPIRED rather than leaving it to spin.
+
+        Parking has to be a pause on the ASKING, never a verdict: the card comes
+        back to a human, and only a real yes moves it. If parking could close the
+        question, the bound above would have turned "no clear answer" into a
+        silent decline -- or worse, into consent.
+        """
+        self.seed(1)
+        unclear = [Decision.AMBIGUOUS] * 3
+        rec = Recorder(ask=lambda app: unclear.pop(0) if unclear else Decision.APPROVE)
+        c = Clock()
+        d = self.deps(rec, reask_after_s=300, max_reasks=3)
+
+        loop.run_forever(self.store, d, clock=c, sleeper=c.sleep, max_cycles=3)
+        self.assertEqual(self.store.get("a0").state, State.EXPIRED)
+        self.assertEqual(len(rec.asks), 3)
+        self.assertEqual(rec.submits, [], "a parked card was submitted without an answer")
+
+        # Time passes. The card is put back in front of a human, and this time
+        # the human says yes.
+        loop.run_forever(self.store, d, clock=c, sleeper=c.sleep, max_cycles=1)
+        self.assertEqual(len(rec.asks), 4, "a parked card was never re-asked")
+        self.assertEqual(rec.submits, ["a0"])
+        self.assertEqual(self.store.get("a0").state, State.SUBMITTED_VERIFIED)
 
 
 # -- the loop: crash safety ----------------------------------------------------

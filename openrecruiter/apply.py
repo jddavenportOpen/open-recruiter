@@ -29,8 +29,13 @@ And two hard stops that no flag reaches:
     is a repeatable event; a reach employer is close to one-shot.
   * Every outbound request passes `guard_url`, which refuses any host that is not
     loopback unless a human has BOTH set OPENRECRUITER_ALLOW_REAL_SUBMIT=1 and
-    passed allow_external=True at the call site. Out of the box this module
-    cannot reach a real employer at all -- develop against `mock_ats`.
+    passed allow_external=True at the call site. That includes every hop of a
+    redirect chain: urllib follows 3xx by itself, so a guard that only sees the
+    URL you typed is not a choke point at all -- a loopback page answering
+    `302 Location: http://169.254.169.254/latest/meta-data/` walks straight out
+    of the sandbox and hands back the result wearing a URL nobody chose. Out of
+    the box this module cannot reach a real employer at all -- develop against
+    `mock_ats`.
 
 There is no verb here that decides, fills, or sends more than one application.
 `submit` takes one id, requires that id to already be APPROVED by a human in the
@@ -138,16 +143,23 @@ class _TextParser(HTMLParser):
 def html_to_text(markup: str) -> str:
     """Block-aware text extraction. One line per block element, so a line diff
     between two pages is meaningful rather than one giant string."""
-    p = _TextParser()
+    p = None
     try:
+        # Constructed inside the try on purpose: a parser that dies in __init__
+        # used to take the caller down with it, which is the one failure mode a
+        # text extractor must not have.
+        p = _TextParser()
         p.feed(markup)
         p.close()
     except Exception:
         # A malformed page is still worth whatever text came out before the
         # parser gave up; returning nothing would read as "the page was empty".
+        # Partial text only ever REMOVES evidence, so it cannot manufacture a
+        # pass -- and the fault itself is not swallowed: `read_back` detects it
+        # with `_fully_parsed` and records the document in `unread_frames`.
         pass
     out = []
-    for chunk in "".join(p.parts).split("\n"):
+    for chunk in "".join(getattr(p, "parts", [])).split("\n"):
         line = " ".join(chunk.split())
         if line:
             out.append(line)
@@ -197,6 +209,10 @@ def guard_url(url: str, *, allow_external: bool = False) -> urllib.parse.SplitRe
     environment variable a human set on purpose. One alone is not enough --
     a caller passing allow_external=True by mistake should still hit a wall, and
     setting the variable should not silently arm code nobody reviewed.
+
+    "Single choke point" is a claim about every REQUEST, not every call site, so
+    it has to hold for the hops this module never typed: see
+    `_GuardedRedirectHandler`, which re-enters this function on each 3xx.
     """
     u = urllib.parse.urlsplit(url or "")
     if u.scheme not in ("http", "https"):
@@ -217,6 +233,44 @@ def guard_url(url: str, *, allow_external: bool = False) -> urllib.parse.SplitRe
 # --------------------------------------------------------------------------- #
 # fetching                                                                     #
 # --------------------------------------------------------------------------- #
+# The attribute http_fetch stamps on its Request so the redirect handler knows
+# which of the two gates the CALLER opened. Absent means closed, so a Request
+# built by anything else is loopback-only no matter how it got here.
+_ALLOW_ATTR = "openrecruiter_allow_external"
+
+
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-runs `guard_url` on every hop of a redirect chain.
+
+    urllib follows 3xx on its own and asks nobody. Without this, `guard_url` is
+    a check on the URL you typed rather than on the request that leaves the
+    machine: a loopback page replying `302 Location: http://169.254.169.254/` is
+    enough to reach cloud metadata with allow_external=False and the real-submit
+    switch unset, i.e. from the DEFAULT, supposedly-sandboxed configuration --
+    and `Fetched.url` then reports the external URL as though we had chosen it.
+
+    The refusal is raised, not returned, for the reason `ExternalHostRefused`
+    exists: mid-chain it has to abort the fetch, and a return value would be
+    mistaken for the redirect having been followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        allow = getattr(req, _ALLOW_ATTR, False)
+        guard_url(newurl, allow_external=allow)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            # Carry the caller's opt-in onto the next Request, or hop three is
+            # judged against a default that this chain never established.
+            setattr(new, _ALLOW_ATTR, allow)
+        return new
+
+
+# Module-level and built from OUR handler, so the guard cannot be skipped by
+# reaching for urlopen()'s global default opener, and nothing outside this
+# module is affected (no install_opener).
+_OPENER = urllib.request.build_opener(_GuardedRedirectHandler)
+
+
 @dataclasses.dataclass(frozen=True)
 class Fetched:
     url: str                      # the FINAL url, after redirects
@@ -246,20 +300,34 @@ def http_fetch(url: str, data: dict | None = None, *, allow_external: bool = Fal
 
     body = urllib.parse.urlencode(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT})
+    setattr(req, _ALLOW_ATTR, allow_external)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read(MAX_BYTES + 1)
             charset = resp.headers.get_content_charset() or "utf-8"
             return Fetched(url=resp.geturl(), status=resp.status,
                            body=raw.decode(charset, "replace"))
+    except ExternalHostRefused as e:
+        # A redirect tried to walk us off the sandbox. Reported as kind="guard",
+        # identical to the refusal at the top of this function, so no caller can
+        # tell the two apart and decide this one was a hiccup worth retrying.
+        return Fetched(url=url, error=str(e), kind="guard")
     except urllib.error.HTTPError as e:
+        final = getattr(e, "url", None) or url
+        try:
+            guard_url(final, allow_external=allow_external)
+        except ExternalHostRefused as refused:
+            # urllib refuses a 3xx to a scheme it will not follow by raising
+            # HTTPError instead of redirecting, and `e.url` is then that
+            # disallowed target (file://, say). Adopting it as the final url
+            # would hand read_back's frame walk a base outside http(s) entirely.
+            return Fetched(url=url, error=str(refused), kind="guard")
         # A 4xx often IS the page: a re-rendered form with an error banner. Read it.
         try:
             raw = e.read(MAX_BYTES + 1)
         except Exception:
             raw = b""
-        return Fetched(url=getattr(e, "url", url), status=e.code,
-                       body=raw.decode("utf-8", "replace"))
+        return Fetched(url=final, status=e.code, body=raw.decode("utf-8", "replace"))
     except urllib.error.URLError as e:
         reason = e.reason
         connect_fault = isinstance(reason, (ConnectionRefusedError, socket.gaierror))
@@ -286,7 +354,11 @@ class PageState:
     frames: tuple[Frame, ...] = ()
     error: str | None = None
     status: int | None = None
-    unread_frames: tuple[str, ...] = ()   # frames we saw and could NOT read
+    # Frames we saw and could NOT read, plus any document whose frame list we
+    # could not finish enumerating (recorded as "<url>#unparsed"). Non-empty
+    # means the form we can see may not be the whole form -- `preflight` reads
+    # this and refuses.
+    unread_frames: tuple[str, ...] = ()
 
     @property
     def readable(self) -> bool:
@@ -324,13 +396,37 @@ class _FrameParser(HTMLParser):
 
 
 def _frame_refs(markup: str) -> tuple[list[str], list[str]]:
-    p = _FrameParser()
+    p = None
     try:
+        p = _FrameParser()
         p.feed(markup)
         p.close()
     except Exception:
+        # Whatever it found is real, but there may be more it never reached. The
+        # shortfall is NOT inferred from this return value -- a short frame list
+        # is indistinguishable from a complete one -- it is detected separately
+        # by `_fully_parsed` and recorded by `read_back`.
         pass
-    return p.srcs, p.docs
+    return getattr(p, "srcs", []), getattr(p, "docs", [])
+
+
+def _fully_parsed(markup: str) -> bool:
+    """Did the HTML parser reach the end of this document?
+
+    `html_to_text` and `_frame_refs` both swallow a parser fault and hand back
+    what they had. For text that is right: half a page is still evidence. For a
+    frame list it is the "we looked everywhere" claim this module exists to
+    refuse, because the caller cannot see the difference. So the fault is caught
+    here, once, and `read_back` records it instead of it being invisible.
+    """
+    for make in (_TextParser, _FrameParser):
+        try:
+            p = make()
+            p.feed(markup)
+            p.close()
+        except Exception:
+            return False
+    return True
 
 
 def read_back(url: str, *, markup: str | None = None, fetch=None,
@@ -364,6 +460,12 @@ def read_back(url: str, *, markup: str | None = None, fetch=None,
     pending = [(markup, url, 0)]
     while pending and len(frames) < max_frames:
         doc, base, depth = pending.pop(0)
+        if not _fully_parsed(doc):
+            # A document the parser could not finish is a document whose frame
+            # list we do not have. Recorded BEFORE the depth check, because a
+            # half-read page is a half-read page whether or not we were going to
+            # descend into it.
+            unread.append(f"{base}#unparsed")
         if depth >= max_depth:
             continue
         srcs, docs = _frame_refs(doc)
@@ -451,6 +553,20 @@ _PLACEHOLDERS = {"todo", "tbd", "fixme", "xxx", "n/a?", "needs_human", "needs hu
                  "?", "-", "--", "fill in", "<fill in>"}
 
 
+def _untypeable(value) -> bool:
+    """A value that goes to a human instead of onto the form.
+
+    Two shapes, one rule: a deferral, and a bool. `answer_for` already refuses a
+    bool from the bank because there is no honest way to type it -- str(True) is
+    "True" -- and a packet field holding one has to be refused for exactly the
+    same reason, or the two halves of this module disagree about the same value.
+    """
+    if value is NEEDS_HUMAN or isinstance(value, bool):
+        return True
+    return isinstance(value, Answer) and (value.needs_human
+                                          or isinstance(value.value, bool))
+
+
 def _committed(value) -> bool:
     """A value a human stood behind. Not blank, not a placeholder, not a deferral."""
     if value is None or value is NEEDS_HUMAN:
@@ -458,7 +574,11 @@ def _committed(value) -> bool:
     if isinstance(value, Answer):
         return not value.needs_human and _committed(value.value)
     if isinstance(value, bool):
-        return True
+        # `answer_for` refuses a bool outright -- "not something to type into a
+        # form" -- and it is right: str(True) is "True", a word no applicant
+        # chose. This used to return True, so preflight passed a bool as a
+        # committed answer and wire() posted the literal "True".
+        return False
     if isinstance(value, (int, float)):
         return True
     if not isinstance(value, str):
@@ -477,11 +597,12 @@ def preflight(page_state, packet: "ApplyPacket") -> Preflight:
 
       OK       every visible required control maps to a value we hold
       BLOCKED  a required control has nothing committed behind it
-      BLIND    we could not read the form, found no controls at all, or found a
-               form that declares nothing required. That last one is the trap:
-               many real forms enforce their requirements in JavaScript, so "no
-               required markers" means we cannot see the rules, NOT that there
-               are none. Reading it as permission is the confident-wrong answer.
+      BLIND    we could not read the form, could not read part of it, found no
+               controls at all, or found a form that declares nothing required.
+               That last one is the trap: many real forms enforce their
+               requirements in JavaScript, so "no required markers" means we
+               cannot see the rules, NOT that there are none. Reading it as
+               permission is the confident-wrong answer.
 
     Anything that throws lands in BLIND. A check that could not run is a refusal.
     """
@@ -493,6 +614,17 @@ def preflight(page_state, packet: "ApplyPacket") -> Preflight:
         if not markups:
             err = getattr(page_state, "error", None) or "the page could not be read"
             return Preflight(Verdict.BLIND, f"cannot inspect the form: {err}")
+
+        # `read_back` goes to the trouble of recording the frames it could not
+        # read; until here nothing ever asked. A top-level form with one
+        # satisfiable field and an unreachable iframe read as OK, and the
+        # application went out missing whatever the frame was asking for.
+        unread = tuple(getattr(page_state, "unread_frames", ()) or ())
+        if unread:
+            return Preflight(
+                Verdict.BLIND,
+                "part of this page could not be read, so the controls we can see "
+                "are not known to be all of them: " + ", ".join(unread))
 
         merged: dict[str, Control] = {}
         for markup in markups:
@@ -650,6 +782,63 @@ class RecordCheck:
     url: str = ""
 
 
+# Matching a value against a record page used to be `probe in blob`, which is a
+# substring test against the whole page. Proven on /drops, the route that exists
+# to catch a silently-dropped field: phone "415-555-0142" was correctly reported
+# missing, but phone "no" came back VERIFIED because "no" is inside "Northwind"
+# in the footer, and phone "1" came back VERIFIED because "1" is inside the
+# reference code AB-1001. A dropped short value -- a yes/no, an initial, a work
+# authorization -- was recorded as verified AND terminal.
+_TOKEN_CHARS = "0-9a-z_-"
+_PROBE_MAX = 60        # long free text is matched on its head, not in full
+_SCOPE_WINDOW = 120    # normalized chars a value may sit after its field's name
+
+
+def _token_hits(probe: str, blob: str, *, whole: bool = True) -> list[int]:
+    """Offsets where `probe` sits on token boundaries in `blob`.
+
+    `whole=False` drops the right-hand boundary only: the probe is the HEAD of a
+    value we truncated ourselves, so the character after it belongs to text we
+    never asked the page to show.
+    """
+    if not probe:
+        return []
+    pat = rf"(?<![{_TOKEN_CHARS}]){re.escape(probe)}"
+    if whole:
+        pat += rf"(?![{_TOKEN_CHARS}])"
+    return [m.start() for m in re.finditer(pat, blob)]
+
+
+def _field_labels(name: str) -> tuple[str, ...]:
+    """The shapes a record view might print a field's name in: the wire name as
+    it is, and with its separators as spaces ("work_authorization" -> "work
+    authorization")."""
+    n = normalize(name)
+    spaced = " ".join(" ".join(re.split(r"[^0-9a-z]+", n)).split())
+    return tuple(dict.fromkeys(x for x in (n, spaced) if x))
+
+
+def _record_carries(name: str, probe: str, blob: str, *, whole: bool) -> tuple[bool, str]:
+    """Is this field's value really in the record, or did it just collide?"""
+    hits = _token_hits(probe, blob, whole=whole)
+    if not hits:
+        return False, "not on the page"
+    if len(probe) >= 16 or len(probe.split()) >= 3:
+        # Distinctive enough that coincidence is not the likely explanation.
+        return True, ""
+    # A short value has to sit next to its own field's name. Otherwise a single
+    # "yes" anywhere on the page verifies a work-authorization answer the
+    # employer never stored -- which is the same false pass in a new costume.
+    windows = [(at, at + len(lab) + _SCOPE_WINDOW)
+               for lab in _field_labels(name) for at in _token_hits(lab, blob)]
+    if not windows:
+        return False, ("too short to identify on its own, and its field name is "
+                       "nowhere on the page to scope it to")
+    if any(start <= h <= end for h in hits for start, end in windows):
+        return True, ""
+    return False, "on the page, but not next to its own field name"
+
+
 def verify_record(record_url: str, packet: "ApplyPacket", *, fetch=None,
                   allow_external: bool = False,
                   timeout: float = DEFAULT_TIMEOUT) -> RecordCheck:
@@ -666,24 +855,44 @@ def verify_record(record_url: str, packet: "ApplyPacket", *, fetch=None,
         return RecordCheck(False, f"could not read the record at {record_url}: "
                                   f"{page.error or 'unreadable'}", url=record_url)
     blob = normalize(text)
-    missing = []
+    missing, why, checked = [], {}, 0
     for name, value in sorted(packet.fields.items()):
         if name in packet.unchecked_fields:
             continue
         if not _committed(value):
             continue
         v = normalize(value.value if isinstance(value, Answer) else value)
+        if not v:
+            continue
         # Long free text is often truncated in a record view; match the head of it
-        # rather than declaring a mismatch on a display decision.
-        probe = v[:60]
-        if probe and probe not in blob:
+        # rather than declaring a mismatch on a display decision. The head is cut
+        # back to a word boundary so we are not demanding the page reproduce a
+        # word we sliced in half.
+        whole = len(v) <= _PROBE_MAX
+        probe = v if whole else (v[:_PROBE_MAX].rsplit(" ", 1)[0] or v[:_PROBE_MAX])
+        checked += 1
+        ok, reason = _record_carries(name, probe, blob, whole=whole)
+        if not ok:
             missing.append(name)
+            why[name] = reason
+
+    if not checked:
+        # Nothing of ours was checkable, so reading the record proved nothing.
+        # This used to return ok=True on any page that loaded -- a pass that
+        # means "we did not look", which is the one answer this module may never
+        # give.
+        return RecordCheck(
+            False,
+            "nothing in this packet could be checked against the stored record "
+            "(every field is blank, deferred, or the employer's own machinery), "
+            "so reading it proves nothing about what was stored",
+            url=record_url)
     if missing:
         return RecordCheck(False, "the stored record is missing value(s) we submitted: "
-                                  + ", ".join(missing),
+                                  + ", ".join(f"{n} ({why[n]})" for n in missing),
                            missing=tuple(missing), url=record_url)
-    return RecordCheck(True, "the stored record carries every value we submitted",
-                       url=record_url)
+    return RecordCheck(True, f"the stored record carries all {checked} value(s) we "
+                             f"submitted and could check", url=record_url)
 
 
 # --------------------------------------------------------------------------- #
@@ -829,12 +1038,11 @@ class ApplyPacket:
         return tuple(m for m in (self.applicant_email, self.applicant_name) if m.strip())
 
     def deferred(self) -> tuple[str, ...]:
-        """Fields still holding NEEDS_HUMAN. Optional fields included: an
-        unanswered question typed into a form as the literal word NEEDS_HUMAN is
-        a fabrication with a straight face."""
-        return tuple(sorted(
-            k for k, v in self.fields.items()
-            if v is NEEDS_HUMAN or (isinstance(v, Answer) and v.needs_human)))
+        """Fields holding something that never became an answer. Optional fields
+        included: an unanswered question typed into a form as the literal word
+        NEEDS_HUMAN is a fabrication with a straight face, and so is a bare bool
+        arriving at the employer as the word "True"."""
+        return tuple(sorted(k for k, v in self.fields.items() if _untypeable(v)))
 
     def wire(self) -> dict:
         """The form-encoded body. Unwraps Answer, refuses to guess at anything else."""
@@ -842,7 +1050,10 @@ class ApplyPacket:
         for k, v in self.fields.items():
             if isinstance(v, Answer):
                 v = v.value
-            if v is NEEDS_HUMAN or v is None:
+            # Unreachable through submit(), which blocks on deferred() first, but
+            # wire() is public and str(True) == "True" is not a value a human
+            # stood behind -- the same judgement answer_for already makes.
+            if v is NEEDS_HUMAN or v is None or isinstance(v, bool):
                 continue
             out[k] = str(v)
         return out
@@ -934,8 +1145,11 @@ def submit(store: Store, app_id: str, packet: ApplyPacket, *,
     if deferred:
         return SubmitResult(
             Outcome.BLOCKED,
-            "the packet still holds unanswered question(s): " + ", ".join(deferred)
-            + ". An unanswered question goes to a human, never onto the form.",
+            "the packet still holds value(s) that never became an answer: "
+            + ", ".join(deferred)
+            + ". An unanswered question -- or a bare bool, which reaches the "
+              "employer as the literal word 'True' -- goes to a human, never "
+              "onto the form.",
             state=app.state)
 
     do_fetch = fetch or (lambda u, data=None: http_fetch(

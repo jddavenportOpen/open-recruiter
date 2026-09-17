@@ -56,7 +56,20 @@ SUPPORTED_ATS = ("greenhouse", "lever", "ashby")
 # Worth retrying: the host is up and telling us to come back. Everything else
 # (401/403/404/422) is a fact about the request, and retrying it is just rudeness
 # with extra steps.
-RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+#
+# The 5xx half is the whole range, not a list of five codes. The enumerated form
+# excluded Cloudflare's 520-524 (origin down / origin timed out / handshake
+# failed), which is the single most common transient failure for a board behind
+# CF -- i.e. the case the retry policy most exists for was the case it skipped.
+RETRY_STATUSES = frozenset({408, 425, 429})
+RETRY_STATUS_RANGES = ((500, 599),)
+
+
+def is_retryable_status(status: int) -> bool:
+    """Whether a status means 'the host is up, come back' rather than 'no'."""
+    if status in RETRY_STATUSES:
+        return True
+    return any(low <= status <= high for low, high in RETRY_STATUS_RANGES)
 
 DEFAULT_CACHE_TTL_S = 900.0
 DEFAULT_MIN_INTERVAL_S = 1.0
@@ -71,8 +84,19 @@ PROJECT_URL = "https://github.com/jddavenportOpen/open-recruiter"
 # points at. They have to be stripped before hashing or the same posting gets a
 # different id depending on which page surfaced it, and "new since last run"
 # starts reporting everything as new.
+#
+# `gh_jid` is deliberately NOT in this set, though it looks like `gh_src` and
+# once was. For an EMBEDDED Greenhouse board, `absolute_url` points at the
+# customer's own careers page and the job id lives only in that parameter:
+#     https://www.company.com/careers?gh_jid=4567890
+# Stripping it collapses every posting at that company onto one canonical url,
+# so one stable_id, so the store's url-unique index keeps exactly one of them
+# and `select_new` reports one of N as new while silently discarding the rest.
+# That is the "new since last run is unanswerable" failure in the module
+# docstring, inverted into silent loss, which is strictly worse. `gh_src` (where
+# the link was clicked) stays stripped; `gh_jid` (which job) is the identity.
 _TRACKING_PARAMS = frozenset({
-    "ref", "source", "src", "utm", "gh_src", "gh_jid", "lever-origin",
+    "ref", "source", "src", "utm", "gh_src", "lever-origin",
     "lever-source", "_gl", "gclid", "fbclid", "mc_cid", "mc_eid",
 })
 _TRACKING_PREFIXES = ("utm_", "lever-source", "hsa_", "_hs")
@@ -204,15 +228,31 @@ def stable_id(url: str) -> str:
 
 
 def canonical_url(url: str) -> str:
-    parts = urllib.parse.urlsplit(str(url).strip())
-    scheme = (parts.scheme or "https").lower()
-    host = (parts.hostname or "").lower()
-    if parts.port and not ((scheme == "https" and parts.port == 443)
-                           or (scheme == "http" and parts.port == 80)):
-        host = f"{host}:{parts.port}"
+    """Normalise a posting url for hashing. A url we cannot parse raises
+    `BoardError`, never the bare `ValueError` urlsplit hands out.
+
+    urlsplit is lazy: `https://host:notaport/x` parses fine and only raises when
+    `.port` is touched, several frames deep inside this function. A ValueError
+    escaping here is not caught by `sweep`, which catches BoardError, so ONE
+    malformed url in ONE board's payload aborted the whole sweep and threw away
+    the postings already collected from healthy boards -- the exact opposite of
+    the documented `allow_partial` contract, with an exception type no caller of
+    this module has any reason to catch. Malformed is a per-board failure.
+    """
+    raw = str(url).strip()
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        scheme = (parts.scheme or "https").lower()
+        host = (parts.hostname or "").lower()
+        port = parts.port
+        query_pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    except ValueError as e:
+        raise BoardError(f"malformed url {raw!r}: {e}", url=raw) from None
+    if port and not ((scheme == "https" and port == 443)
+                     or (scheme == "http" and port == 80)):
+        host = f"{host}:{port}"
     path = parts.path.rstrip("/") or "/"
-    keep = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-            if not _is_tracking(k)]
+    keep = [(k, v) for k, v in query_pairs if not _is_tracking(k)]
     query = urllib.parse.urlencode(sorted(keep))
     return urllib.parse.urlunsplit((scheme, host, path, query, ""))
 
@@ -270,12 +310,28 @@ def urllib_fetcher(url: str, headers: dict, timeout_s: float = DEFAULT_TIMEOUT_S
         raise TransportError(f"{url}: {e}", url=url) from None
 
 
-class ResponseCache:
-    """On-disk, TTL'd, keyed by the canonical url. Only successes are stored."""
+# Above this many files on disk, `put` sweeps expired entries first. Entries are
+# bounded by board count in the normal case, so this only bites a cache whose
+# config churned; it exists so the directory cannot grow without limit forever.
+DEFAULT_CACHE_MAX_ENTRIES = 2000
 
-    def __init__(self, directory: str, ttl_s: float, clock: Callable[[], float] = time.time):
+
+class ResponseCache:
+    """On-disk, TTL'd, keyed by the canonical url.
+
+    Only bodies that were fetched successfully AND decoded successfully are
+    stored. Both halves matter: the caller writes the entry after the decode,
+    because an HTTP 200 carrying a maintenance page, a CDN interstitial or an
+    auth redirect is a failure the status line does not admit to, and caching it
+    keeps the board broken for the full TTL after the host has recovered --
+    off cache, with no network call left to notice the recovery.
+    """
+
+    def __init__(self, directory: str, ttl_s: float, clock: Callable[[], float] = time.time,
+                 max_entries: int = DEFAULT_CACHE_MAX_ENTRIES):
         self.dir = directory
         self.ttl_s = float(ttl_s)
+        self.max_entries = int(max_entries)
         self._clock = clock
         os.makedirs(self.dir, exist_ok=True)
 
@@ -294,13 +350,47 @@ class ResponseCache:
             # safe: the cache is an optimisation, never the source of a verdict.
             return None
         if self._clock() - float(entry.get("fetched_at", 0)) > self.ttl_s:
+            # Unlink on read: a stale entry is already known to be useless, and
+            # ignoring it without removing it is how the directory grew forever.
+            with contextlib.suppress(OSError):
+                os.unlink(self.path_for(url))
             return None
         body = entry.get("body")
         return body if isinstance(body, str) else None
 
+    def prune(self) -> int:
+        """Remove every expired entry. Returns how many went. Never raises: a
+        cache we cannot tidy is a fuller disk, not a wrong answer."""
+        removed = 0
+        now = self._clock()
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return 0
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(self.dir, name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    entry = json.load(fh)
+                fresh = now - float(entry.get("fetched_at", 0)) <= self.ttl_s
+            except (OSError, ValueError, TypeError):
+                fresh = False  # unreadable is unusable; it refetches anyway
+            if not fresh:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+                    removed += 1
+        return removed
+
     def put(self, url: str, body: str) -> None:
         if self.ttl_s <= 0:
             return
+        try:
+            if len(os.listdir(self.dir)) > self.max_entries:
+                self.prune()
+        except OSError:
+            pass
         path = self.path_for(url)
         tmp = f"{path}.{os.getpid()}.tmp"
         try:
@@ -368,9 +458,15 @@ class BoardClient:
                 self.cache_hits += 1
                 return self._decode(url, cached)
         body = self._fetch_body(url)
+        # Decode BEFORE caching. A 200 whose body is not JSON is a failure, and
+        # writing it first poisons the board for the whole TTL: every subsequent
+        # call raises off cache without a network request, so the run stays
+        # broken long after the host recovered. Only a body that parsed is
+        # allowed to become the cached answer.
+        value = self._decode(url, body)
         if self.cache is not None:
             self.cache.put(url, body)
-        return self._decode(url, body)
+        return value
 
     def _decode(self, url: str, body: str) -> Any:
         try:
@@ -398,7 +494,7 @@ class BoardClient:
                     return resp.body
                 last_status = resp.status
                 last_error = f"HTTP {resp.status}: {resp.body[:200].strip()}"
-                if resp.status not in RETRY_STATUSES:
+                if not is_retryable_status(resp.status):
                     raise BoardError(f"{url} failed: {last_error}",
                                      url=url, status=resp.status, attempts=attempt + 1)
                 retry_after = _retry_after_seconds(resp)

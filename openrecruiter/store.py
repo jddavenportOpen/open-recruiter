@@ -54,7 +54,13 @@ LEGAL: dict[State, set[State]] = {
     State.BELOW_BAR: {State.BUILDING},          # only via an explicit rebuild
     State.AWAITING_APPROVAL: {State.APPROVED, State.DECLINED, State.EXPIRED},
     State.EXPIRED: {State.AWAITING_APPROVAL},   # re-ask, never auto-honour
-    State.APPROVED: {State.SUBMITTING},
+    # APPROVED must have an exit that is not SUBMITTING. Without one, an approval
+    # that goes stale (the human said yes, then the submit could not run) is a fixed
+    # point: the row can never leave APPROVED, and a runner with nothing else queued
+    # spins on it forever -- calling the quota reader every iteration, which in
+    # production shells a real CLI run and burns the very quota the pacer exists to
+    # protect. Found by breaking the loop, not by reading it.
+    State.APPROVED: {State.SUBMITTING, State.EXPIRED},
     State.DECLINED: set(),
     State.SUBMITTING: {State.SUBMITTED_VERIFIED, State.SUBMITTED_UNVERIFIED, State.FAILED},
     State.SUBMITTED_VERIFIED: set(),

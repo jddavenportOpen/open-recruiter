@@ -563,5 +563,212 @@ class NoNetworkAndNoDecisions(unittest.TestCase):
                                  f"boards grew a decision verb: {name}")
 
 
+# -- regressions ---------------------------------------------------------------
+
+# Greenhouse serves two shapes of absolute_url. Every id test above uses the
+# HOSTED shape (boards.greenhouse.io/<token>/jobs/<id>), where the job id is in
+# the path -- which is exactly why the suite could not see the embedded shape
+# break. These pin the embedded one.
+EMBEDDED = "https://www.company.com/careers?gh_jid={}"
+
+EMBEDDED_PAYLOAD = {"jobs": [
+    {"id": 4567890, "title": "Product Manager",
+     "absolute_url": EMBEDDED.format(4567890), "updated_at": "2026-09-01T00:00:00Z"},
+    {"id": 9999999, "title": "Engineering Manager",
+     "absolute_url": EMBEDDED.format(9999999), "updated_at": "2026-09-02T00:00:00Z"},
+    {"id": 1111111, "title": "Designer",
+     "absolute_url": EMBEDDED.format(1111111), "updated_at": "2026-09-03T00:00:00Z"},
+]}
+
+
+class EmbeddedBoardIdTests(unittest.TestCase):
+    """`gh_jid` IS the job id on an embedded board, not a tracking parameter.
+
+    Stripping it collapsed every posting at one company onto a single stable id.
+    The store's url-unique index then kept one row, `select_new` announced one of
+    N as new, and the other N-1 were discarded with nothing raised anywhere --
+    silent loss wearing the costume of the invariant this module exists to hold.
+    """
+
+    def test_gh_jid_survives_canonicalisation(self):
+        self.assertEqual(canonical_url(EMBEDDED.format(4567890)),
+                         "https://www.company.com/careers?gh_jid=4567890")
+
+    def test_two_embedded_postings_do_not_share_one_id(self):
+        a, b = EMBEDDED.format(4567890), EMBEDDED.format(9999999)
+        self.assertNotEqual(stable_id(a), stable_id(b),
+                            "two different jobs at one company hashed to the same id")
+
+    def test_gh_src_is_still_stripped(self):
+        # The distinction that makes this a fix and not an over-correction:
+        # gh_src says where the link was clicked, gh_jid says which job it is.
+        base = EMBEDDED.format(4567890)
+        self.assertEqual(stable_id(base + "&gh_src=a1b2c3"), stable_id(base))
+
+    def test_every_posting_on_an_embedded_board_is_distinct(self):
+        c, _, _ = client({"greenhouse": ok(EMBEDDED_PAYLOAD)})
+        postings = c.greenhouse("company")
+        self.assertEqual(len({p["id"] for p in postings}), 3,
+                         "an embedded board's postings collapsed onto one id")
+
+    def test_knowing_one_embedded_posting_does_not_hide_the_others(self):
+        # Against an EMPTY known set this passes even while broken, because three
+        # copies of one id are still three unseen ids. The loss only shows once
+        # one of them has been seen: under the bug that single id masks the whole
+        # company, and select_new returns nothing.
+        c, _, _ = client({"greenhouse": ok(EMBEDDED_PAYLOAD)})
+        postings = c.greenhouse("company")
+        known = {next(p["id"] for p in postings if p["role"] == "Product Manager")}
+        new = select_new(postings, known)
+        self.assertEqual(sorted(p["role"] for p in new),
+                         ["Designer", "Engineering Manager"],
+                         "postings were silently discarded rather than offered")
+
+
+class NonJsonTwoHundredIsNotCached(unittest.TestCase):
+    """A maintenance page served with HTTP 200 must not poison the cache.
+
+    The write happened before the decode, so one interstitial kept the board
+    failing for the whole TTL -- off cache, with no network call left that could
+    notice the host had recovered.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_non_json_200_leaves_the_cache_empty(self):
+        # A non-zero TTL is the whole point: the existing non-JSON test runs with
+        # cache_ttl_s=0, which disables the cache and so could never fire.
+        c, _, _ = client({"greenhouse": HttpResponse(200, "<html>maintenance</html>")},
+                         cache_dir=self.tmp.name, cache_ttl_s=900)
+        with self.assertRaises(BoardError):
+            c.greenhouse("acme")
+        self.assertEqual(os.listdir(self.tmp.name), [],
+                         "an undecodable 200 body was written to the cache")
+
+    def test_the_board_recovers_on_the_very_next_call(self):
+        routes = {"greenhouse": [HttpResponse(200, "<html>maintenance</html>"),
+                                 ok(GH_PAYLOAD)]}
+        c, f, _ = client(routes, cache_dir=self.tmp.name, cache_ttl_s=900)
+        with self.assertRaises(BoardError):
+            c.greenhouse("acme")
+        self.assertEqual(len(c.greenhouse("acme")), 1,
+                         "the board kept failing off a cached maintenance page")
+        self.assertEqual(f.count, 2, "the retry never reached the network")
+
+    def test_a_decodable_body_is_still_cached(self):
+        c, f, _ = client(dict(ALL_ROUTES), cache_dir=self.tmp.name, cache_ttl_s=900)
+        c.greenhouse("acme")
+        c.greenhouse("acme")
+        self.assertEqual(f.count, 1, "the fix disabled caching outright")
+
+
+class MalformedUrlStaysInsideBoardError(unittest.TestCase):
+    """`urlsplit` is lazy: a bad port only raises when `.port` is read, several
+    frames inside canonical_url. `sweep` catches BoardError, so a bare ValueError
+    escaped it and destroyed postings already collected from healthy boards."""
+
+    BAD = "https://host:notaport/x"
+
+    def test_canonical_url_raises_board_error_not_value_error(self):
+        with self.assertRaises(BoardError):
+            canonical_url(self.BAD)
+
+    def test_stable_id_raises_board_error_not_value_error(self):
+        with self.assertRaises(BoardError):
+            stable_id(self.BAD)
+
+    def test_one_malformed_url_does_not_destroy_a_partial_sweep(self):
+        routes = {
+            "boards/acme": ok(GH_PAYLOAD),
+            "boards/broken": ok({"jobs": [{"id": 1, "title": "Bad",
+                                           "absolute_url": self.BAD}]}),
+            "api.lever.co": ok(LEVER_PAYLOAD),
+        }
+        c, _, _ = client(routes, max_retries=0)
+        sources = [Source("greenhouse", "acme"),
+                   Source("greenhouse", "broken"),
+                   Source("lever", "acme")]
+        # Without the fix this line raises ValueError out of sweep entirely, and
+        # the greenhouse postings already in hand are thrown away with it.
+        result = c.sweep(sources, allow_partial=True)
+        self.assertFalse(result.ok)
+        self.assertEqual([f.token for f in result.failures], ["broken"])
+        self.assertEqual(sorted(p["ats"] for p in result.postings),
+                         ["greenhouse", "lever"],
+                         "healthy boards' postings were lost to one bad url")
+
+    def test_a_malformed_url_still_fails_closed_by_default(self):
+        c, _, _ = client({"greenhouse": ok({"jobs": [
+            {"id": 1, "title": "Bad", "absolute_url": self.BAD}]})}, max_retries=0)
+        with self.assertRaises(BoardError):
+            c.sweep([Source("greenhouse", "broken")])
+
+
+class CloudflareFiveXXIsRetried(unittest.TestCase):
+    """520-524 (origin down / timed out / handshake failed) is the most common
+    transient failure for a board behind Cloudflare, and the enumerated
+    retry-status list excluded every one of them."""
+
+    def test_a_520_is_retried_and_then_succeeds(self):
+        clock = FakeClock()
+        routes = {"greenhouse": [HttpResponse(520, "origin down"), ok(GH_PAYLOAD)]}
+        c, f, _ = client(routes, clock=clock, max_retries=1, backoff_base_s=1.0)
+        self.assertEqual(len(c.greenhouse("acme")), 1,
+                         "a Cloudflare 520 was treated as a permanent 'no'")
+        self.assertEqual(f.count, 2)
+
+    def test_the_whole_5xx_range_is_retryable(self):
+        for status in (500, 504, 520, 521, 522, 523, 524, 599):
+            with self.subTest(status=status):
+                self.assertTrue(boards.is_retryable_status(status))
+
+    def test_a_4xx_is_still_not_retried(self):
+        for status in (400, 401, 403, 404, 422):
+            with self.subTest(status=status):
+                self.assertFalse(boards.is_retryable_status(status))
+        self.assertTrue(boards.is_retryable_status(429))
+
+
+class CacheEviction(unittest.TestCase):
+    """Stale entries were ignored by `get` but never unlinked, so the directory
+    only ever grew. Bounded by board count, but a config churn is unbounded."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def cache(self, clock, **kw):
+        return boards.ResponseCache(self.tmp.name, ttl_s=100, clock=clock.time, **kw)
+
+    def test_reading_a_stale_entry_unlinks_it(self):
+        clock = FakeClock()
+        cache = self.cache(clock)
+        cache.put("https://x.io/a", "{}")
+        clock.t += 101
+        self.assertIsNone(cache.get("https://x.io/a"))
+        self.assertEqual(os.listdir(self.tmp.name), [],
+                         "a stale cache entry was read past and then left on disk")
+
+    def test_put_prunes_once_the_directory_is_over_its_cap(self):
+        clock = FakeClock()
+        cache = self.cache(clock, max_entries=2)
+        for n in range(3):
+            cache.put(f"https://x.io/{n}", "{}")
+        clock.t += 101
+        cache.put("https://x.io/fresh", "{}")
+        self.assertEqual(len(os.listdir(self.tmp.name)), 1,
+                         "expired entries survived a put over the entry cap")
+
+    def test_prune_leaves_fresh_entries_alone(self):
+        clock = FakeClock()
+        cache = self.cache(clock)
+        cache.put("https://x.io/a", "{}")
+        self.assertEqual(cache.prune(), 0)
+        self.assertEqual(cache.get("https://x.io/a"), "{}",
+                         "prune evicted an entry that was still within its TTL")
+
+
 if __name__ == "__main__":
     unittest.main()

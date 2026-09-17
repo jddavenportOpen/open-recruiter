@@ -27,6 +27,16 @@ Three design positions worth reading before extending:
   `_ask`, which turns a missing or throwing accessor into `ContextUnavailable`
   and then into an `Intent` with `refusal` set and `ok` False. An unreadable
   queue never renders as an empty one.
+
+* **A refusal must name an exit that exists.** The ambiguity refusal below used
+  to fire on EVERY input while a card and a goal change were both outstanding --
+  `queue`, `help`, `goals` and any free-text question included -- and then told
+  the user to "answer the card itself", which hit the same refusal. A surface
+  whose only escape from a state is a verb it refuses is a deadlock, and the
+  whole "you can just talk to it" claim is dead in that state. So the ambiguity
+  gate refuses ONLY a reading that is genuinely a yes or a no, and the text it
+  returns names exits (`skip <id>`, `pause`, a fresh `set ...`) that are checked
+  ahead of the gate and therefore actually work.
 """
 from __future__ import annotations
 
@@ -73,7 +83,13 @@ class Context(Protocol):
         next_item()        -> one item mapping, or None when the queue is empty
         get(app_id)        -> one item mapping, or None when unknown
         goals()            -> the goals mapping, or None when none are set
-        refine_goals(phrase, current) -> the PROPOSED goals mapping
+        refine_goals(goals, instruction) -> the PROPOSED goals, in the argument
+            order and return shape of `openrecruiter.interview.refine_goals`:
+            `(proposed_goals, Diff)`. A bare mapping is also accepted, so a
+            context may inject something simpler, but the ARGUMENT ORDER is the
+            production one -- this docstring previously said `(phrase, current)`,
+            which is reversed, and every test injected its own refiner, so the
+            verb had never once been exercised against the real function.
         parse_reply(text)  -> optional; defaults to the channel layer's one reader
     """
     outstanding_card_id: str | None
@@ -174,15 +190,44 @@ _WHY = {"why", "explain"}
 _SKIP = {"skip", "decline", "drop"}
 # "pause please" must halt just as surely as "pause". Anything longer than filler
 # ("stop applying to startups") is a sentence, not the halt verb, and falls through.
-_PAUSE_FILLER = {"", "please", "now", "everything", "all", "it", "this", "for now"}
+# Words, not phrases: the set is matched one word at a time by `_all_filler`.
+_PAUSE_FILLER = {"please", "now", "everything", "all", "it", "this", "that", "for",
+                 "right", "immediately", "just", "already", "pls", "thanks", "thank",
+                 "you", "ok", "okay"}
+
+# A state a human may be asked to approve. An allowlist, not a denylist: a state
+# this module has never heard of is one it cannot vouch for, and presenting an
+# unvouched-for row is exactly the failure the tier gate exists to prevent.
+# `expired` is here because re-asking is what expiry MEANS (store.LEGAL routes
+# EXPIRED -> AWAITING_APPROVAL); `below_bar` and `screened_out` never are.
+_OFFERABLE = {"awaiting_approval", "expired"}
 
 # An id is an opaque primary key, so this only rejects shapes that cannot be one.
+# Determiners and quantifiers are in here for the same reason the pronouns are:
+# "skip the acme one" split to head "skip" + rest "the", and "the" matched the id
+# pattern, so the surface reported skipping an application called "the".
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}$")
-_NOT_IDS = {"it", "this", "that", "one", "them", "him", "her", "us", "me", "yes", "no"}
+_NOT_IDS = {"it", "this", "that", "one", "them", "him", "her", "us", "me", "yes", "no",
+            "the", "a", "an", "all", "any", "some", "both", "each", "every", "other",
+            "another", "ones", "these", "those", "my", "your", "first", "last", "next",
+            "everything", "anything", "please", "now", "again", "there", "they"}
+
+_WORDS = re.compile(r"[a-z0-9]+")
 
 
 def _looks_like_id(tok: str) -> bool:
     return bool(_ID.match(tok)) and tok.lower() not in _NOT_IDS
+
+
+def _all_filler(rest: str) -> bool:
+    """Is everything after the halt word mere politeness or deixis?
+
+    Punctuation is stripped per WORD here, not just off the head word as `_norm`
+    does. Without that, "stop it." fell out of the halt branch and into the
+    consent reader, which reads it as a plain NO -- so the halt silently DECLINED
+    the open card and left the loop running. The one verb that must not be
+    fragile was the fragile one, and it failed toward keeping going."""
+    return all(w in _PAUSE_FILLER for w in _WORDS.findall(rest.lower()))
 
 
 def _norm(text: str) -> tuple[str, str]:
@@ -272,7 +317,7 @@ def route(text: str, ctx: Any) -> Intent:
     # 1. Halting outranks everything, including being read as an answer to a card.
     #    A halt never sends anything, so routing it here cannot manufacture consent
     #    -- the outstanding card is declined, never approved.
-    if head in _PAUSE and rest.lower() in _PAUSE_FILLER:
+    if head in _PAUSE and _all_filler(rest):
         return _pause(raw, card)
 
     # 2. Targeted commands are checked BEFORE the y/n reader, because "skip a1"
@@ -289,18 +334,28 @@ def route(text: str, ctx: Any) -> Intent:
     #    a command. "go" and "skip" live in both vocabularies; while a card is open
     #    the card wins, which is what keeps a one-word answer from starting a new
     #    session instead of answering the question actually on screen.
-    if card and pending:
-        # Two things want the same "y". Ambiguity is never consent.
-        return _refuse(Verb.DECISION, raw,
-                       "there is both an application and a goal change waiting on a yes, "
-                       "so a one-word answer is ambiguous and I will not guess which you "
-                       "meant. Deal with the application first ('skip <id>', or answer the "
-                       "card itself), then re-send the 'set ...'.",
-                       app_id=card)
     try:
         verdict = _consent(ctx, raw) if (card or pending) else "ambiguous"
     except ContextUnavailable as e:
         return _refuse(Verb.DECISION, raw, str(e), app_id=card)
+
+    if card and pending and verdict in ("approve", "reject"):
+        # Two things want the same "y". Ambiguity is never consent.
+        #
+        # This gate is deliberately AFTER the consent read and conditional on it.
+        # Refusing unconditionally (which is what it used to do) refused `queue`,
+        # `help`, `goals`, `go` and every free-text question too, and pointed the
+        # user at "answer the card itself" -- which lands right back here. The
+        # three exits named below are all checked ABOVE this line, so each one is
+        # reachable from inside this state.
+        return _refuse(Verb.DECISION, raw,
+                       "there is both an application and a goal change waiting on a yes, "
+                       "so a bare yes or no is ambiguous and I will not guess which you "
+                       f"meant. Clear one of them first: 'skip {card}' declines the "
+                       "application, a fresh 'set ...' replaces the goal change, and "
+                       "'pause' halts everything. Then answer the other. "
+                       "'why <id>', 'queue' and plain questions all still work.",
+                       app_id=card)
 
     if card and verdict in ("approve", "reject"):
         return Intent(verb=Verb.DECISION, text=raw, app_id=card, decision=verdict,
@@ -311,6 +366,22 @@ def route(text: str, ctx: Any) -> Intent:
 
     # 4. Plain commands.
     if head in _GO:
+        # "the card wins" has to be enforced here, not inherited from the consent
+        # reader. Only "go" and "ok" happen to be in that reader's _YES set, so
+        # "next", "start", "begin", "resume" and "continue" -- and "go ahead and
+        # send it", which is too long for the reader to call consent -- all fell
+        # straight through to _go and presented a SECOND application while the
+        # first still had nobody's answer on it.
+        if card:
+            return _refuse(
+                Verb.GO, raw,
+                f"{card} is still waiting on you"
+                + (" — and so is a goal change. Clear them with "
+                   f"'skip {card}' and a fresh 'set ...', or 'pause'."
+                   if pending else
+                   f" — answer it Y / N, or 'skip {card}'.")
+                + " I will bring you the next one after that.",
+                app_id=card)
         return _go(raw, ctx)
     if head in _QUEUE:
         return _queue(raw, ctx)
@@ -319,6 +390,11 @@ def route(text: str, ctx: Any) -> Intent:
     if head in _HELP:
         return Intent(verb=Verb.HELP, text=raw, reply=help_text())
     if head in _SKIP:
+        # Reachability, stated honestly because it reads the other way: with a
+        # card open, "skip" and "skip it" are read as a plain NO by the consent
+        # parser two steps above and DECLINE that card -- they never arrive here.
+        # This branch is for a skip the parser could not read as either answer
+        # ("skip the acme one"), where there is nothing to do but ask which.
         return _refuse(Verb.SKIP, raw,
                        ("Which one? Reply N to skip the one I just sent, or "
                         "'skip <id>'." if card else "Which one? Use 'skip <id>'."),
@@ -365,6 +441,21 @@ def _go(raw: str, ctx: Any) -> Intent:
     if not isinstance(item, Mapping):
         return _refuse(Verb.GO, raw, f"next_item() returned a {type(item).__name__}, not one "
                                      f"application. Refusing to present it.")
+    # Defense in depth. Presenting an item IS asking a human to approve sending
+    # it, and the bar that decides what may be asked about lived entirely in the
+    # caller's next_item(). This module already knows what below_bar means (see
+    # `_why`: "never offered for approval"), so a caller bug that put one on deck
+    # was being laundered into an approval prompt by the surface that knew better.
+    state = str(item.get("state") or "").strip().lower()
+    if state not in _OFFERABLE:
+        return _refuse(
+            Verb.GO, raw,
+            f"next_item() put {_label(item)} on deck in state "
+            f"{state or '(none recorded)'}, which is not awaiting your approval. I will "
+            "not present it: a resume that failed its tier's gate is never offered, and "
+            "routing one to you through here would be the gate's only loophole. "
+            "'why " + str(item.get("app_id") or item.get("id") or "<id>") + "' explains it.",
+            app_id=item.get("app_id") or item.get("id"))
     was_paused = bool(_attr(ctx, "paused", False))
     reply = _describe(item)
     if item.get("weakest_reason"):
@@ -484,6 +575,18 @@ def _goals(raw: str, ctx: Any) -> Intent:
                   reply="\n".join(f"{k}: {v}" for k, v in _flatten(goals).items()))
 
 
+def _unpack_refinement(result: Any) -> tuple[Any, Any]:
+    """Split `refine_goals`'s return into (proposed, diff).
+
+    The production function returns `(goals, Diff)`; a context may inject a
+    plainer refiner that returns the mapping alone. Anything else is handed
+    through untouched so the Mapping check below refuses it by name rather than
+    this helper guessing at a shape."""
+    if isinstance(result, tuple) and len(result) == 2:
+        return result[0], result[1]
+    return result, None
+
+
 def _set(raw: str, phrase: str, ctx: Any) -> Intent:
     if not phrase:
         return _refuse(Verb.SET, raw, "Set what? e.g. 'set only remote roles above $180k'.")
@@ -501,10 +604,27 @@ def _set(raw: str, phrase: str, ctx: Any) -> Intent:
                            f"I cannot refine goals right now: refine_goals is unavailable "
                            f"({e}). Nothing was changed.")
     try:
-        proposed = refiner(phrase, current)
+        # (goals, instruction) -- the production order. This call used to be
+        # refiner(phrase, current), which raised "goals should be a dict from
+        # build_goals, got str" against the real function every single time. It
+        # failed loud rather than wrong, which is the right direction to fail,
+        # but the verb had never worked outside a test that injected its own.
+        result = refiner(current, phrase)
     except Exception as e:                                   # noqa: BLE001
         return _refuse(Verb.SET, raw, f"refine_goals failed on {phrase!r}: "
                                       f"{e.__class__.__name__}: {e}. Nothing was changed.")
+    proposed, diff = _unpack_refinement(result)
+    # interview.refine_goals hands back the ORIGINAL goals whenever any clause was
+    # unreadable, so an unparsed instruction arrives here as a zero-line diff and
+    # would be reported as "that would not change anything" -- a plain misreading
+    # of "I could not understand you", and the one place a half-understood
+    # sentence could be waved through as understood.
+    if diff is not None and not getattr(diff, "ok", True):
+        unread = ", ".join(repr(u) for u in (getattr(diff, "unparsed", ()) or ()))
+        return _refuse(Verb.SET, raw,
+                       f"I could not read {unread or 'part of that'} in {phrase!r}, so I "
+                       f"have changed nothing and am not proposing a diff. Say it another "
+                       f"way and I will show you what it would do.")
     if not isinstance(proposed, Mapping) or not proposed:
         return _refuse(Verb.SET, raw, f"I could not turn {phrase!r} into a goal change. "
                                       f"Nothing was changed.")

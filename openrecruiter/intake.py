@@ -40,7 +40,10 @@ from .engine import extract_text, pdftext
 
 __all__ = ["IntakeError", "discover_resumes", "extract", "merge_to_bank",
            "claims_ledger", "claim_conflicts",
-           "HIGH", "LOW", "UNREADABLE", "SUPPORTED_EXTS"]
+           "HIGH", "LOW", "UNREADABLE", "SUPPORTED_EXTS",
+           # Both are read by callers deciding whether a read is worth grading and
+           # how far short of HIGH it fell, so they are API, not internals.
+           "MIN_USABLE_CHARS", "SIGNAL_WEIGHTS"]
 
 
 class IntakeError(RuntimeError):
@@ -726,6 +729,18 @@ def _skeleton(text: str) -> str:
 def claim_conflicts(claims: list[dict]) -> list[dict]:
     """Groups of claims that say the same sentence with different numbers.
 
+    Drift is keyed on WHERE the sentence sits, not on which file it came from.
+    Two generations of a resume are the obvious case, but "the long one with the
+    stale numbers still pasted in" is just as ordinary a shape: one file carrying
+    both "$2M to $20M" and "$2M to $18M" is the same drift, and keying on the
+    source file reported nothing at all for it.
+
+    A group is drift only when two locations carry DIFFERENT numbers. That one
+    test covers both ways a group can be innocent: the same numbers restated in
+    several places is agreement, and a single location -- two numbers inside one
+    bullet ("grew it from $2M to $20M"), or a bullet stored once because it was
+    identical in several files -- has nothing to disagree with by construction.
+
     Each group names every value and the file it came from. Nothing is resolved
     here: which number is true is a question only the person can answer, and
     picking the biggest one automatically is how a resume acquires a claim its
@@ -734,23 +749,24 @@ def claim_conflicts(claims: list[dict]) -> list[dict]:
     by_skeleton: dict[str, list[dict]] = {}
     for c in claims:
         if c["kind"] == "year":
-            continue
+            continue                      # a date range is when, not what was claimed
         by_skeleton.setdefault(c["skeleton"], []).append(c)
 
     out = []
     for skeleton, group in by_skeleton.items():
-        per_source: dict[str, list[str]] = {}
+        per_location: dict[str, list[str]] = {}
         for c in group:
-            per_source.setdefault(c["source_file"] or "(untraced)", []).append(c["value"])
-        if len(per_source) < 2:
-            continue
-        value_sets = {tuple(v) for v in per_source.values()}
-        if len(value_sets) < 2:
-            continue                      # same numbers in several files: agreement
+            per_location.setdefault(c["location"], []).append(c["value"])
+        # One test, not two: a lone location yields exactly one value tuple, so
+        # "said once" and "said the same twice" are the same answer here. A
+        # separate len(per_location) check would be a line no mutation can kill.
+        if len({tuple(v) for v in per_location.values()}) < 2:
+            continue                      # agreement, or a single statement
         out.append({
             "skeleton": skeleton,
             "texts": sorted({c["text"] for c in group}),
             "values": sorted({(c["source_file"] or "(untraced)", c["value"]) for c in group}),
-            "sources": sorted(per_source),
+            "sources": sorted({c["source_file"] or "(untraced)" for c in group}),
+            "locations": sorted(per_location),
         })
     return sorted(out, key=lambda g: g["skeleton"])

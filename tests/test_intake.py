@@ -203,8 +203,25 @@ class DiscoveryNeverConfusesEmptyWithBlind(Tmp):
             intake.discover_resumes(os.path.join(self.dir, "does-not-exist"))
 
     def test_a_file_is_not_a_folder(self):
-        with self.assertRaises(intake.IntakeError):
+        """Asserting on the MESSAGE, not merely on the raise. A .txt is not
+        executable, so the permissions guard below rejects it too -- this test
+        passed for years with the isdir check deleted, telling the caller to
+        chmod a file that was never the problem."""
+        with self.assertRaises(intake.IntakeError) as raised:
             intake.discover_resumes(os.path.join(self.dir, "current.txt"))
+        self.assertIn("is a file, not a folder", str(raised.exception))
+
+    def test_a_folder_we_cannot_enter_says_permissions(self):
+        """The other half of the pair: the permissions refusal has to stay
+        reachable and has to say something different from the one above."""
+        locked = tempfile.mkdtemp(dir=self.dir)
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o700)
+        if os.access(locked, os.R_OK | os.X_OK):
+            self.skipTest("running as a user chmod cannot lock out (root?)")
+        with self.assertRaises(intake.IntakeError) as raised:
+            intake.discover_resumes(locked)
+        self.assertIn("permissions", str(raised.exception))
 
     def test_an_empty_folder_is_a_real_empty_answer(self):
         empty = tempfile.mkdtemp(dir=self.dir)
@@ -543,6 +560,280 @@ class ClaimsLedgerTracesEveryNumber(Tmp):
         bank = intake.merge_to_bank([intake.extract(path)])
         locations = {c["location"] for c in intake.claims_ledger(bank)}
         self.assertTrue(any(loc.startswith("summaries[") for loc in locations), locations)
+
+
+# --------------------------------------------------------------------------- #
+class ContactLineSurvivesTheMerge(Tmp):
+    """The contact block is the one part of a bank that is on EVERY resume built
+    from it. A wrong line here is not a degraded bullet, it is mail that never
+    arrives -- so which source wins, and whether each field was captured at all,
+    are asserted rather than assumed."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.current = write(cls.dir, "dana-2024.txt", RESUME_2024)
+        cls.old = write(cls.dir, "dana-2021.txt", RESUME_2021)
+
+    def bank(self, *paths):
+        return intake.merge_to_bank([intake.extract(p) for p in paths])
+
+    def _conflict(self, bank, field):
+        hits = [c for c in bank["_conflicts"] if c["field"] == field]
+        self.assertEqual(len(hits), 1, f"{field} conflict missing: {bank['_conflicts']}")
+        return hits[0]
+
+    def test_the_live_email_wins_and_the_dead_one_does_not(self):
+        """Recording the disagreement is only half the job. The 2021 file carries
+        an address that stopped working years ago; picking it silently puts a dead
+        contact line on every resume built from this bank."""
+        bank = self.bank(self.current, self.old)
+        self.assertEqual(bank["contact"]["email"], "dana@example.org")
+        self.assertNotEqual(bank["contact"]["email"], "dana.reyes@oldmail.example")
+        conflict = self._conflict(bank, "contact.email")
+        self.assertEqual(conflict["kept"], bank["contact"]["email"],
+                         "the bank kept one value and reported keeping another")
+        self.assertEqual({v["value"] for v in conflict["values"]},
+                         {"dana@example.org", "dana.reyes@oldmail.example"})
+
+    def test_the_highest_confidence_source_wins_not_the_first_one(self):
+        """The documented rule is 'highest confidence wins, ties break on input
+        order'. Both fixtures above grade 1.0, so the ranking itself is never
+        exercised by them -- here the weak source is deliberately FIRST."""
+        weak = write(self.dir, "weak-contact.txt", "Dana Reyes\nweak@example.org\n"
+                     + ("prose about the work that was done here. " * 12))
+        strong = write(self.dir, "strong-contact.txt",
+                       RESUME_2024.replace("dana@example.org", "strong@example.org"))
+        weak_rec, strong_rec = intake.extract(weak), intake.extract(strong)
+        self.assertLess(weak_rec["confidence"], strong_rec["confidence"],
+                        "fixture broken: the two sources must not grade the same")
+        bank = intake.merge_to_bank([weak_rec, strong_rec])
+        self.assertEqual(bank["contact"]["email"], "strong@example.org",
+                         "input order beat confidence")
+        self.assertEqual(self._conflict(bank, "contact.email")["kept"],
+                         "strong@example.org")
+
+    def test_the_name_is_captured(self):
+        self.assertEqual(self.bank(self.current)["contact"].get("name"), "Dana Reyes")
+
+    def test_the_phone_is_captured(self):
+        self.assertEqual(self.bank(self.current)["contact"].get("phone"), "(415) 555-0142")
+
+    def test_the_location_is_captured(self):
+        self.assertEqual(self.bank(self.current)["contact"].get("location"), "Portland, OR")
+
+
+# --------------------------------------------------------------------------- #
+class TheBankKeepsWhatItRead(Tmp):
+    """A gap that is reported is a feature; a section that silently evaporates is
+    the bug. These assert the CONTENT arrived, not just that nothing complained."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.current = write(cls.dir, "dana-2024.txt", RESUME_2024)
+
+    def bank(self, *paths):
+        return intake.merge_to_bank([intake.extract(p) for p in paths])
+
+    def test_education_lines_are_kept_verbatim(self):
+        bank = self.bank(self.current)
+        self.assertEqual(bank.get("education_raw"), ["Brigham Young University, MBA, 2027"])
+        self.assertTrue(any(g["field"] == "education" and "verbatim" in g["why"]
+                            for g in bank["_gaps"]), bank["_gaps"])
+
+    def test_skills_reach_the_pool(self):
+        pool = self.bank(self.current)["skills_pool"].get("general", [])
+        for skill in ("Python", "SQL", "Product strategy", "Stakeholder management"):
+            self.assertIn(skill, pool)
+        self.assertFalse(any(g["field"] == "skills_pool" for g in self.bank(self.current)["_gaps"]))
+
+    def test_a_job_header_with_nothing_under_it_is_named_as_a_gap(self):
+        """An empty job is the shape a mis-detected header leaves behind, and it
+        is also what a resume whose bullets did not survive extraction looks
+        like. Either way it has to say so."""
+        path = write(self.dir, "no-bullets.txt",
+                     "Dana Reyes\ndana@example.org | (415) 555-0142 | Portland, OR\n\n"
+                     "SUMMARY\nProduct leader who ships infrastructure people rely on.\n\n"
+                     "EXPERIENCE\nAcme Corp | Principal Product Manager | 2020 - 2024\n\n"
+                     "EDUCATION\nBrigham Young University, MBA, 2027\n\n"
+                     "SKILLS\nPython, SQL, Forecasting\n")
+        bank = self.bank(path)
+        self.assertEqual(bank["jobs"][0]["bullets"], {})
+        holes = [g for g in bank["_gaps"] if g["field"].endswith("].bullets")]
+        self.assertTrue(holes, f"an empty job was banked in silence: {bank['_gaps']}")
+        self.assertIn("no bullet lines", holes[0]["why"])
+
+    def test_a_bank_with_no_jobs_at_all_says_so(self):
+        """The whole point of _gaps: a career-shaped hole has to be louder than an
+        empty list, and it has to say what a job header looks like so the person
+        can see why theirs was not one."""
+        path = write(self.dir, "no-jobs.txt",
+                     "Dana Reyes\ndana@example.org | (415) 555-0142 | Portland, OR\n\n"
+                     "SUMMARY\nProduct leader who ships infrastructure people rely on "
+                     "every single day of the week.\n\n"
+                     "EDUCATION\nBrigham Young University, MBA, 2027\n\n"
+                     "SKILLS\nPython, SQL, Forecasting, Stakeholder management\n")
+        bank = self.bank(path)
+        self.assertEqual(bank["jobs"], [])
+        holes = [g for g in bank["_gaps"] if g["field"] == "jobs"]
+        self.assertTrue(holes, f"a bank with no career said nothing: {bank['_gaps']}")
+        self.assertIn("job header", holes[0]["why"])
+
+    def test_prose_that_mentions_a_date_range_is_not_a_job(self):
+        """The failure the length cap exists for: a sentence carrying '2019 to
+        2021' becomes a header, the job under it gets no bullets, and a real line
+        of experience is converted into an empty employer nobody worked for."""
+        prose = ("Between 2019 to 2021 the entire organisation moved onto a new platform "
+                 "and this sentence is deliberately long prose that merely happens to "
+                 "mention a date range.")
+        path = write(self.dir, "prose-dates.txt",
+                     "Dana Reyes\ndana@example.org | (415) 555-0142 | Portland, OR\n\n"
+                     "SUMMARY\nProduct leader who ships infrastructure people rely on.\n\n"
+                     "EXPERIENCE\nAcme Corp | Principal Product Manager | 2020 - 2024\n"
+                     "- Grew the services line and kept the lights on for everyone.\n"
+                     "- Shipped the platform three departments still depend on daily.\n"
+                     + prose + "\n\nSKILLS\nPython, SQL\n")
+        bank = self.bank(path)
+        self.assertEqual([j["id"] for j in bank["jobs"]],
+                         ["acme-corp__principal-product-manager"],
+                         "a prose sentence was banked as an employer")
+        self.assertEqual(len(bank["jobs"][0]["bullets"]), 2)
+        loose = [g for g in bank["_gaps"] if g["field"] == "experience.lines"]
+        self.assertTrue(loose, "the line was neither used nor reported")
+        self.assertIn("moved onto a new platform", loose[0]["why"])
+
+
+# --------------------------------------------------------------------------- #
+class GradingThresholdsAreNotDecoration(Tmp):
+    def _txt(self, name, body):
+        return write(self.dir, name, body)
+
+    def test_one_section_header_is_not_enough_structure(self):
+        """A resume has several sections. One header means the read found SUMMARY
+        and lost EXPERIENCE, EDUCATION and SKILLS -- which is a gutted document,
+        not a thin one, and the threshold is what says so."""
+        body = "Dana Reyes\ndana@example.org\nSUMMARY\n" + ("some prose about the work here. " * 20)
+        rec = intake.extract(self._txt("one-header.txt", body))
+        self.assertEqual(rec["signals"]["header_count"], 1)
+        self.assertFalse(rec["signals"]["has_section_headers"])
+        self.assertEqual(rec["level"], intake.LOW)
+
+    def test_a_plain_file_still_has_to_meet_a_length_expectation(self):
+        """The yield expectation is not just a PDF concern. A .txt whose bytes are
+        mostly padding extracts far short of its weight, and a zero expectation
+        would hand that signal out free to every .txt and .md ever read."""
+        rec = intake.extract(self._txt("padded.txt", RESUME_2024 + "\n" + (" " * 6000)))
+        self.assertGreater(rec["signals"]["expected_chars"], rec["chars"],
+                           "the expectation is free: every plain file passes it")
+        self.assertFalse(rec["signals"]["length_meets_expectation"])
+        self.assertEqual(rec["level"], intake.LOW)
+        self.assertTrue(any("characters out of" in w for w in rec["warnings"]))
+
+    def test_a_file_too_big_to_read_is_refused_and_says_why(self):
+        """Skipping it quietly would leave a source contributing nothing with no
+        record of why -- the same 'empty is not silence' rule the folder guard
+        keeps, one level down."""
+        path = os.path.join(self.dir, "huge.txt")
+        with open(path, "wb") as fh:
+            # Sparse: getsize() reports the full length without writing 12MB.
+            fh.seek(intake.extract_text.MAX_BYTES + 1)
+            fh.write(b"\0")
+        self.assertGreater(os.path.getsize(path), intake.extract_text.MAX_BYTES)
+        rec = intake.extract(path)
+        self.assertEqual(rec["level"], intake.UNREADABLE)
+        self.assertFalse(rec["usable"])
+        self.assertIsNone(rec["engine"])
+        self.assertEqual(rec["chars"], 0)
+        self.assertIn("larger than", rec["error"])
+        self.assertIn(rec["error"], rec["warnings"])
+
+
+# --------------------------------------------------------------------------- #
+class ConflictDetectionIsNarrowOnPurpose(Tmp):
+    """Every false conflict buries a true one. These pin the two things that are
+    deliberately NOT drift, and the one shape that was being missed."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.head = ("Dana Reyes\n%s | (415) 555-0142\n\nSUMMARY\nProduct leader who ships "
+                    "infrastructure people rely on every single day of the week.\n\n"
+                    "EXPERIENCE\n")
+
+    def bank(self, *paths):
+        return intake.merge_to_bank([intake.extract(p) for p in paths])
+
+    def conflicts(self, *paths):
+        return intake.claim_conflicts(intake.claims_ledger(self.bank(*paths)))
+
+    def test_a_year_that_moved_between_generations_is_not_drift(self):
+        """'finished in 2019' vs 'finished in 2021' is a corrected date, not a
+        restated number. Reporting it drowns the ledger in noise, since every
+        generation of a resume re-dates something."""
+        a = write(self.dir, "yr-2019.txt", self.head % "a@example.org"
+                  + "Acme Corp | Principal Product Manager | 2020 - 2024\n"
+                    "- Led the migration that finished in 2019 on schedule.\n\nSKILLS\nPython\n")
+        b = write(self.dir, "yr-2021.txt", self.head % "b@example.org"
+                  + "Acme Corp | Principal Product Manager | 2020 - 2024\n"
+                    "- Led the migration that finished in 2021 on schedule.\n\nSKILLS\nPython\n")
+        ledger = intake.claims_ledger(self.bank(a, b))
+        self.assertEqual({c["kind"] for c in ledger}, {"year"}, "fixture broken")
+        self.assertEqual(self.conflicts(a, b), [],
+                         "a date range was reported as a disagreement about a number")
+
+    def test_the_same_number_in_two_places_is_agreement_not_drift(self):
+        """Two files, two separate bullets, identical numbers. The sentence
+        appears twice; nothing about it disagrees."""
+        a = write(self.dir, "same-a.txt", self.head % "a@example.org"
+                  + "Acme Corp | Principal Product Manager | 2020 - 2024\n"
+                    "- Grew the services line to $20M in annual recurring revenue.\n"
+                    "\nSKILLS\nPython\n")
+        b = write(self.dir, "same-b.txt", self.head % "b@example.org"
+                  + "Northstar Labs | Senior Analyst | 2015 - 2018\n"
+                    "- Grew the services line to $20M in annual recurring revenue.\n"
+                    "\nSKILLS\nPython\n")
+        ledger = intake.claims_ledger(self.bank(a, b))
+        self.assertEqual(len({c["location"] for c in ledger}), 2, "fixture broken")
+        self.assertEqual({c["value"] for c in ledger}, {"$20M"}, "fixture broken")
+        self.assertEqual(self.conflicts(a, b), [],
+                         "two files agreeing were reported as disagreeing")
+
+    def test_drift_inside_one_file_is_surfaced_too(self):
+        """'The long one with the stale numbers still pasted in' is an ordinary
+        resume shape. Keying drift on the source FILE reported nothing here."""
+        one = write(self.dir, "long-one.txt", self.head % "a@example.org"
+                    + "Acme Corp | Principal Product Manager | 2020 - 2024\n"
+                      "- Grew the services line from $2M to $20M in annual recurring revenue.\n"
+                      "- Grew the services line from $2M to $18M in annual recurring revenue.\n"
+                      "\nSKILLS\nPython\n")
+        groups = self.conflicts(one)
+        self.assertEqual(len(groups), 1, f"stale numbers in one file went unseen: {groups}")
+        self.assertEqual({v for _s, v in groups[0]["values"]}, {"$2M", "$20M", "$18M"})
+        self.assertEqual(len(groups[0]["locations"]), 2)
+
+    def test_two_numbers_in_one_sentence_do_not_argue_with_each_other(self):
+        """'from $2M to $20M' is one statement with two numbers in it. A group
+        needs two distinct locations, or every growth bullet is a conflict."""
+        one = write(self.dir, "single.txt", self.head % "a@example.org"
+                    + "Acme Corp | Principal Product Manager | 2020 - 2024\n"
+                      "- Grew the services line from $2M to $20M in annual recurring revenue.\n"
+                      "- Shipped a platform used by 3,000 people every month.\n"
+                      "\nSKILLS\nPython\n")
+        self.assertEqual(self.conflicts(one), [])
+
+
+class PublicApiIsWhatTheModuleDeclares(unittest.TestCase):
+    def test_every_exported_name_exists(self):
+        for name in intake.__all__:
+            self.assertTrue(hasattr(intake, name), f"__all__ exports a missing {name}")
+
+    def test_the_grading_constants_callers_read_are_exported(self):
+        """Both are read outside this module to decide whether a read is worth
+        grading and how far short of HIGH it fell. Leaving them out of __all__
+        makes `from intake import *` a different module than the docs describe."""
+        for name in ("MIN_USABLE_CHARS", "SIGNAL_WEIGHTS"):
+            self.assertIn(name, intake.__all__)
 
 
 class TheIntakeHasNoBulkVerb(unittest.TestCase):

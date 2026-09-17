@@ -232,6 +232,12 @@ class Deps:
     consent_max_age_s: float | None = 86400.0
     reask_after_s: float = 21600.0
     max_retries: int = 3
+    # An unclear answer moves nothing, so asking again in the next cycle gets the
+    # same non-answer -- and the row sits at the HEAD of the queue while it does,
+    # so one unanswered card stalls every other application indefinitely. After
+    # this many unclear answers the card is parked to be re-asked later. It is a
+    # bound on re-asking, not on applying: nothing here lets a cycle do more.
+    max_reasks: int = 3
     wall_sleep_s: float = 900.0
     idle_sleep_s: float = 300.0
     blind_backoff_s: float = 60.0
@@ -242,6 +248,19 @@ class Deps:
 
 
 _RESULT_TAIL = 200
+
+# Outcomes that leave the store exactly as they found it. Running the next cycle
+# immediately would read the same rows and reach the same conclusion, so each one
+# has to cost real time: an unpaced fixed point is a hot loop around
+# deps.quota_reader(), which in production shells a real CLI run and burns the
+# quota this module exists to pace. The other outcomes all move a row, and the
+# ones that can repeat (a retryable FAILED) are bounded by deps.max_retries.
+#
+# RE_ASK and STALE_APPROVAL are also each cut off at the source -- bounded
+# re-asking in _ask, and parking in _pick -- because pacing a fixed point only
+# makes it a slow one. This is the backstop, and it holds for any future outcome
+# added to the set.
+_NON_ADVANCING = frozenset({Outcome.IDLE, Outcome.RE_ASK, Outcome.STALE_APPROVAL})
 
 
 class GateUnverifiable(RuntimeError):
@@ -302,13 +321,22 @@ def _pick(store: Store, deps: Deps, now: float, reported: set, skipped: list):
         age = _consent_age(app, now)
         if deps.consent_max_age_s is None or age is None or age <= deps.consent_max_age_s:
             return app
+        # A stale yes cannot be submitted and cannot be re-asked while it sits in
+        # APPROVED, which makes the row a FIXED POINT: with nothing else queued
+        # the runner returned STALE_APPROVAL every cycle forever, calling
+        # deps.quota_reader() each time -- which in production shells a real CLI
+        # run, so the spin burns the very budget this module paces. Measured at
+        # 50 cycles, 50 quota reads, zero sleeps. Park it in EXPIRED, the exit
+        # the store keeps for exactly this, and the card is re-asked instead.
+        store.transition(app.id, State.EXPIRED,
+                         f"approved {age / 3600:.1f}h ago, outside the consent window")
         skipped.append(app.id)
         if app.id not in reported:
             reported.add(app.id)
             deps.notify(
                 f"{app.id}: approved {age / 3600:.1f}h ago, older than the "
                 f"{deps.consent_max_age_s / 3600:.1f}h consent window -- NOT submitting. "
-                "Re-run it deliberately if you still want it sent.")
+                "The card will be re-asked; a yes this old is not acted on.")
     for app in store.by_state(State.EXPIRED):
         if now - _last_change(store, app.id) >= deps.reask_after_s:
             return app
@@ -353,11 +381,26 @@ def _gate(app: Application, result) -> tuple:
         fields["claims"] = list(result["claims"])
 
     payload = result.get("panel")
-    tier = str(result.get("tier") or app.tier or "standard").lower()
+    # Which bar this is judged against takes TWO INDEPENDENT READS -- what the
+    # row says and what the build result claims -- and the STRICTER one wins.
+    # Same shape, and the same reason, as apply.is_reach_target: a mislabelled
+    # tier must not be a way past this. The build result is a claim by the thing
+    # being judged, so it may raise its own bar and never lower the row's.
+    declared = str(result.get("tier") or "").strip().lower()
+    on_row = str(app.tier or "").strip().lower()
+    tier = "reach" if "reach" in (declared, on_row) else (declared or on_row or "standard")
 
     if isinstance(payload, dict) and payload.get("personas"):
         payload = dict(payload)
-        payload.setdefault("company", app.company)
+        # The EMPLOYER is a fact about the row, never a field of the build
+        # result. panel.is_reach() keys the whole bar off this one string --
+        # threshold, raw floor, and the majority interview vote -- so a builder
+        # that sent its own `company` was choosing its own pass mark. setdefault
+        # let it: it filled the gap only when the builder stayed silent, so a
+        # builder that spoke always won. Measured on an Anthropic row at panel
+        # 85 / raw 72: omitting company gave below_bar, sending "" or "Acme"
+        # gave a card and a submitted application.
+        payload["company"] = app.company
         agg = panel.aggregate(payload)                      # IncompletePanel is a refusal
         derived = bool(agg["overall_pass"])
         if tier == "reach" and not agg["is_reach"]:
@@ -424,7 +467,7 @@ def _paused_by_wall(deps: Deps, text: str, now: float, app_id=None) -> Result:
     return Result(Outcome.PAUSED, app_id=app_id, detail="plan wall", resume_at=resume_at)
 
 
-def _build(store: Store, deps: Deps, app: Application, now: float) -> Result:
+def _build(store: Store, deps: Deps, app: Application, now: float, reasks: dict) -> Result:
     store.transition(app.id, State.BUILDING, "build")
     try:
         result = deps.build(app)
@@ -457,7 +500,7 @@ def _build(store: Store, deps: Deps, app: Application, now: float) -> Result:
         return Result(Outcome.BELOW_BAR, app.id, State.BELOW_BAR,
                       "below the bar for its tier; never offered")
     app = store.transition(app.id, State.AWAITING_APPROVAL, "passed the gate", **fields)
-    return _ask(store, deps, app, now)
+    return _ask(store, deps, app, now, reasks)
 
 
 def _as_asked(value) -> Asked:
@@ -470,7 +513,7 @@ def _as_asked(value) -> Asked:
     raise TypeError(f"ask returned {value!r}, which is not a Decision")
 
 
-def _ask(store: Store, deps: Deps, app: Application, now: float) -> Result:
+def _ask(store: Store, deps: Deps, app: Application, now: float, reasks: dict) -> Result:
     a = _as_asked(deps.ask(app))
     marks = {k: v for k, v in (("card_id", a.card_id), ("channel", a.channel)) if v}
     if a.decision is Decision.APPROVE:
@@ -490,6 +533,25 @@ def _ask(store: Store, deps: Deps, app: Application, now: float) -> Result:
         return Result(Outcome.EXPIRED, app.id, State.EXPIRED, "consent window closed; will re-ask")
     # AMBIGUOUS: the channel has already re-asked. Nothing moves, and silence is
     # never read as a yes.
+    #
+    # "Nothing moves" is also what makes this a fixed point. The row stays in
+    # AWAITING_APPROVAL, which _pick takes ahead of any new build, so the next
+    # cycle asks the same question about the same row -- forever, at full speed,
+    # and no other application is ever built. Measured at 40 cycles: 40 asks,
+    # zero sleeps, the second application never touched. So re-asking is bounded
+    # here, and past the bound the card is PARKED rather than abandoned: EXPIRED
+    # is re-asked after `reask_after_s`, so the question stays open while the
+    # queue moves. Parking is not an answer and cannot become one -- the only
+    # way out of EXPIRED is being asked again.
+    asked = reasks.get(app.id, 0) + 1
+    reasks[app.id] = asked
+    if asked >= deps.max_reasks:
+        store.transition(app.id, State.EXPIRED,
+                         f"no clear answer after {asked} asks; parked to re-ask later")
+        deps.notify(f"{app.id}: no clear yes or no after {asked} asks -- parking the card. "
+                    "It will be re-asked; nothing is submitted in the meantime.")
+        return Result(Outcome.EXPIRED, app.id, State.EXPIRED,
+                      f"no clear answer after {asked} asks; parked, will re-ask")
     return Result(Outcome.RE_ASK, app.id, app.state, "no clear yes or no; card stands")
 
 
@@ -532,7 +594,7 @@ def _submit(store: Store, deps: Deps, app: Application, now: float) -> Result:
 
 
 def run_once(store: Store, deps: Deps, now: float | None = None,
-             _reported: set | None = None) -> Result:
+             _reported: set | None = None, _reasks: dict | None = None) -> Result:
     """Process EXACTLY ONE application, as far as it can legally go, then return.
 
     There is no parameter here that means "more than one", and adding one would
@@ -540,6 +602,10 @@ def run_once(store: Store, deps: Deps, now: float | None = None,
     """
     now = time.time() if now is None else now
     reported = _reported if _reported is not None else set()
+    # How many unclear answers each card has given THIS process. Carried across
+    # cycles by run_forever; a bare run_once starts fresh, which is the cautious
+    # direction -- it can only ask once more, never park sooner.
+    reasks = _reasks if _reasks is not None else {}
 
     stop = deps.killswitch.engaged()
     if stop:
@@ -559,18 +625,20 @@ def run_once(store: Store, deps: Deps, now: float | None = None,
     if app is None:
         if skipped:
             # Visible, not silent: a yes we will not act on is a row a human has
-            # to decide about, and IDLE would bury it.
-            return Result(Outcome.STALE_APPROVAL, skipped[0], State.APPROVED,
-                          "approved outside the consent window; not submitting")
+            # to decide about, and IDLE would bury it. _pick has already parked
+            # the row in EXPIRED, so this reports once and then the loop idles
+            # rather than reporting the same stranded yes forever.
+            return Result(Outcome.STALE_APPROVAL, skipped[0], State.EXPIRED,
+                          "approved outside the consent window; not submitting, will re-ask")
         return Result(Outcome.IDLE, detail="nothing to work on")
 
     if app.state in (State.DISCOVERED, State.FAILED):
-        return _build(store, deps, app, now)
+        return _build(store, deps, app, now, reasks)
     if app.state is State.EXPIRED:
         app = store.transition(app.id, State.AWAITING_APPROVAL, "re-asking after expiry")
-        return _ask(store, deps, app, now)
+        return _ask(store, deps, app, now, reasks)
     if app.state is State.AWAITING_APPROVAL:
-        return _ask(store, deps, app, now)
+        return _ask(store, deps, app, now, reasks)
     if app.state is State.APPROVED:
         return _submit(store, deps, app, now)
     # _pick returns nothing else; if it ever does, refuse loudly rather than
@@ -594,6 +662,7 @@ def run_forever(store: Store, deps: Deps, clock=time.time, sleeper=time.sleep,
         lock.acquire(deps.notify)
     try:
         reported: set = set()
+        reasks: dict = {}
         while max_cycles is None or cycles < max_cycles:
             cycles += 1
             stop = deps.killswitch.engaged()
@@ -602,7 +671,7 @@ def run_forever(store: Store, deps: Deps, clock=time.time, sleeper=time.sleep,
                 stopped = f"kill switch: {stop}"
                 break
             try:
-                r = run_once(store, deps, now=clock(), _reported=reported)
+                r = run_once(store, deps, now=clock(), _reported=reported, _reasks=reasks)
             except quota.QuotaUnknown as e:
                 blind += 1
                 deps.notify(f"quota unreadable ({blind}/{deps.max_blind_quota_reads}): {e}")
@@ -622,8 +691,8 @@ def run_forever(store: Store, deps: Deps, clock=time.time, sleeper=time.sleep,
             if r.outcome is Outcome.PAUSED:
                 sleeper(quota.sleep_for(r.resume_at, clock(), deps.wall_sleep_s))
                 continue
-            if r.outcome is Outcome.IDLE:
-                sleeper(deps.idle_sleep_s)
+            if r.outcome in _NON_ADVANCING:
+                sleeper(max(deps.idle_sleep_s, deps.min_gap_s))
                 continue
             if deps.min_gap_s:
                 sleeper(deps.min_gap_s)

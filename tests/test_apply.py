@@ -13,9 +13,11 @@ Nothing in this file talks to the network. `guard_url` would refuse it.
 """
 from __future__ import annotations
 
+import http.server
 import inspect
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -38,6 +40,82 @@ def full_packet(**over) -> ApplyPacket:
     fields.update(over.pop("fields", {}))
     return ApplyPacket(fields=fields, applicant_name=over.pop("applicant_name", NAME),
                        applicant_email=over.pop("applicant_email", EMAIL), **over)
+
+
+class _Redirector:
+    """A loopback server that answers 3xx, so the redirect CHAIN can be tested.
+
+    It exists because nothing in this suite exercised a redirect at all, and
+    urllib follows them without asking: the guard can be a wall on the URL you
+    typed and a wide-open door on the one the server picks next.
+
+    Routes:
+      /to-external   302 to a host outside this machine
+      /to-metadata   302 to the cloud metadata address
+      /hop1          302 to /hop2 on this same server (a legal first hop)
+      /hop2          302 to a host outside this machine
+      /to-file       302 to a file:// url -- urllib refuses this one by raising
+                     HTTPError rather than redirecting, which is a different
+                     code path with the same destination
+      /ok            302 to /landed on this same server
+      /landed        200 with a body, so a followed redirect is provable
+    """
+
+    EXTERNAL = "http://192.0.2.1/"                              # TEST-NET-1
+    METADATA = "http://169.254.169.254/latest/meta-data/"
+    LOCAL_FILE = "file:///etc/passwd"
+
+    def __init__(self):
+        outer = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *_a):
+                pass
+
+            def _redirect(self, to):
+                self.send_response(302)
+                self.send_header("Location", to)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path == "/to-external":
+                    return self._redirect(outer.EXTERNAL)
+                if self.path == "/to-metadata":
+                    return self._redirect(outer.METADATA)
+                if self.path == "/hop1":
+                    return self._redirect("/hop2")
+                if self.path == "/hop2":
+                    return self._redirect(outer.EXTERNAL)
+                if self.path == "/to-file":
+                    return self._redirect(outer.LOCAL_FILE)
+                if self.path == "/ok":
+                    return self._redirect("/landed")
+                body = b"<p>landed</p>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self._srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self._srv.daemon_threads = True
+        self._t = threading.Thread(target=self._srv.serve_forever,
+                                   kwargs={"poll_interval": 0.05}, daemon=True)
+
+    def start(self) -> "_Redirector":
+        self._t.start()
+        return self
+
+    def stop(self) -> None:
+        self._srv.shutdown()
+        self._srv.server_close()
+        self._t.join(timeout=5)
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self._srv.server_address[1]}{path}"
 
 
 class ATSCase(unittest.TestCase):
@@ -168,6 +246,86 @@ class TheNetworkIsShutByDefault(unittest.TestCase):
         self.assertEqual(got.kind, "guard")
         self.assertIsNone(got.body)
         self.assertFalse(got.ok)
+
+
+# --------------------------------------------------------------------------- #
+class EveryHopOfARedirectIsGuarded(unittest.TestCase):
+    """The guard has to hold for the request that leaves, not the URL we typed.
+
+    urllib follows 3xx through its own HTTPRedirectHandler, which re-enters
+    nothing. So a page on loopback answering `302 Location: http://<anywhere>/`
+    was enough to make a real outbound request with allow_external=False and
+    OPENRECRUITER_ALLOW_REAL_SUBMIT unset -- the DEFAULT, supposedly mock-only
+    configuration -- and `Fetched.url` came back wearing a host nobody chose.
+
+    A short timeout is deliberate: if the guard ever stops covering redirects,
+    these go red in seconds rather than hanging on a black-holed address.
+    """
+
+    TIMEOUT = 2.0
+
+    def setUp(self):
+        self._saved = os.environ.pop("OPENRECRUITER_ALLOW_REAL_SUBMIT", None)
+        self.addCleanup(self._restore)
+        self.r = _Redirector().start()
+        self.addCleanup(self.r.stop)
+
+    def _restore(self):
+        if self._saved is None:
+            os.environ.pop("OPENRECRUITER_ALLOW_REAL_SUBMIT", None)
+        else:
+            os.environ["OPENRECRUITER_ALLOW_REAL_SUBMIT"] = self._saved
+
+    def _assert_refused(self, path, host):
+        got = http_fetch(self.r.url(path), timeout=self.TIMEOUT)
+        self.assertEqual(got.kind, "guard",
+                         f"the redirect to {host} was followed off the sandbox "
+                         f"(kind={got.kind!r}, error={got.error!r})")
+        self.assertIsNone(got.body)
+        self.assertFalse(got.ok)
+        self.assertIn(host, got.error)
+        return got
+
+    def test_a_redirect_to_an_external_host_is_refused(self):
+        self._assert_refused("/to-external", "192.0.2.1")
+
+    def test_a_redirect_to_cloud_metadata_is_refused(self):
+        self._assert_refused("/to-metadata", "169.254.169.254")
+
+    def test_the_second_hop_is_guarded_as_hard_as_the_first(self):
+        """Hop one is loopback and legal. Hop two must still be judged, or the
+        opt-in is something a chain can launder by taking one innocent step."""
+        self._assert_refused("/hop1", "192.0.2.1")
+
+    def test_a_refused_redirect_does_not_report_the_external_url_as_final(self):
+        got = self._assert_refused("/to-external", "192.0.2.1")
+        self.assertEqual(got.url, self.r.url("/to-external"),
+                         "the refusal handed back a URL we never reached")
+
+    def test_a_redirect_to_a_local_file_is_refused_and_not_reported_as_final(self):
+        """This one never reaches the redirect handler -- urllib raises instead.
+        Same wall, different door: the refusal must look identical, and the
+        file:// url must not come back as the page we ended on, or read_back
+        walks frames against it."""
+        got = http_fetch(self.r.url("/to-file"), timeout=self.TIMEOUT)
+        self.assertEqual(got.kind, "guard", f"error={got.error!r}")
+        self.assertIsNone(got.body)
+        self.assertEqual(got.url, self.r.url("/to-file"))
+
+    def test_a_loopback_redirect_is_still_followed(self):
+        """The control: the guard refuses hops, it does not break redirects."""
+        got = http_fetch(self.r.url("/ok"), timeout=self.TIMEOUT)
+        self.assertTrue(got.ok, got.error)
+        self.assertTrue(got.url.endswith("/landed"))
+        self.assertIn("landed", got.body)
+
+    def test_read_back_cannot_be_walked_off_the_sandbox_either(self):
+        """read_back rides the FINAL url, so an unguarded chain contaminates the
+        verification read too, not just the fetch."""
+        page = read_back(self.r.url("/to-external"), timeout=self.TIMEOUT)
+        self.assertFalse(page.readable)
+        self.assertIsNone(page.text())
+        self.assertIn("192.0.2.1", page.error)
 
 
 # --------------------------------------------------------------------------- #
@@ -308,6 +466,113 @@ class PreflightRefusesWhatItCannotSee(ATSCase):
 
 
 # --------------------------------------------------------------------------- #
+class APartlyReadPageIsNotAReadPage(ATSCase):
+    """`unread_frames` was recorded by read_back and consulted by nobody.
+
+    Proven before the fix: a top-level form carrying one satisfiable required
+    field, plus an iframe on a dead port, came back Verdict.OK -- so the real
+    form one frame down was never read and the application went out incomplete,
+    with `unread_frames` holding the evidence the whole time.
+    """
+
+    FORM = ("<form method='post'><input name='full_name' required>"
+            "<iframe src='http://127.0.0.1:1/the-real-form'></iframe></form>")
+
+    def test_an_unread_frame_makes_the_page_blind_not_ok(self):
+        page = read_back(self.ats.url("normal"), markup=self.FORM)
+        self.assertTrue(page.unread_frames, "the fixture's frame was reachable")
+        pf = preflight(page, full_packet())
+        self.assertIs(pf.verdict, Verdict.BLIND,
+                      "a form with an unread frame passed preflight")
+        self.assertFalse(pf.ok)
+        self.assertIn("127.0.0.1:1/the-real-form", pf.reason)
+
+    def test_nothing_is_posted_when_part_of_the_form_could_not_be_read(self):
+        app = self.approved("normal")
+        seen = []
+
+        def fetch(u, data=None):
+            seen.append(("POST" if data is not None else "GET", u))
+            if data is not None:
+                return apply.Fetched(url=u, status=200, body=(
+                    f"<p>Application received. A copy was sent to {EMAIL}.</p>"))
+            if u.startswith(self.ats.url("normal")):
+                return apply.Fetched(url=u, status=200, body=self.FORM)
+            return apply.Fetched(url=u, error="[Errno 61] Connection refused",
+                                 kind="connect")
+
+        r = submit(self.store, app, full_packet(), fetch=fetch)
+        self.assertIs(r.outcome, Outcome.BLOCKED, r.reason)
+        self.assertEqual([m for m, _ in seen if m == "POST"], [],
+                         "an application was posted while part of its form was unread")
+        self.assertIs(self.store.get(app).state, State.APPROVED)
+
+    def test_a_document_the_parser_could_not_finish_is_recorded(self):
+        """A frame missed because the parser died is invisible, not absent. Both
+        parsers that walk a document are covered, because either one dying means
+        the frame list we have is not known to be the frame list there is."""
+        for name in ("_TextParser", "_FrameParser"):
+            with self.subTest(parser=name):
+                with mock.patch.object(apply, name,
+                                       side_effect=RuntimeError("parser exploded")):
+                    page = read_back(self.ats.url("normal"),
+                                     markup="<p>hi</p><iframe src='/receipt'></iframe>")
+                self.assertTrue(
+                    any(u.endswith("#unparsed") for u in page.unread_frames),
+                    "a half-parsed document claimed a complete frame list")
+                self.assertIs(preflight(page, full_packet()).verdict, Verdict.BLIND)
+
+    def test_a_fully_read_page_is_not_penalised(self):
+        """The control: ordinary pages must not all turn BLIND."""
+        page = read_back(self.ats.url("normal"))
+        self.assertEqual(page.unread_frames, ())
+        self.assertIs(preflight(page, full_packet()).verdict, Verdict.OK)
+
+
+# --------------------------------------------------------------------------- #
+class ABoolIsNotAnAnswer(ATSCase):
+    """answer_for refuses a bool -- "not something to type into a form" -- while
+    _committed accepted one and wire() str()'d it to the literal "True". Two
+    halves of the same module disagreeing about the same value; answer_for is
+    the one that is right."""
+
+    def test_a_bare_bool_is_not_a_committed_value(self):
+        page = read_back(self.ats.url("normal"))
+        for bad in (True, False):
+            pf = preflight(page, full_packet(fields={"email": bad}))
+            self.assertIs(pf.verdict, Verdict.BLOCKED, f"{bad!r} passed as an answer")
+            self.assertIn("email", pf.missing)
+
+    def test_the_wire_body_never_carries_the_word_True(self):
+        wire = full_packet(fields={"phone": True}).wire()
+        self.assertNotIn("phone", wire,
+                         "a bool reached the employer as the literal word 'True'")
+        self.assertNotIn("True", wire.values())
+
+    def test_a_bool_is_named_as_something_a_human_has_to_settle(self):
+        self.assertEqual(full_packet(fields={"phone": True}).deferred(), ("phone",))
+        self.assertEqual(
+            full_packet(fields={"phone": Answer(True, matched="x")}).deferred(),
+            ("phone",))
+
+    def test_nothing_is_posted_when_a_field_holds_a_bool(self):
+        app = self.approved("normal")
+        r = submit(self.store, app, full_packet(fields={"phone": True}))
+        self.assertIs(r.outcome, Outcome.BLOCKED, r.reason)
+        self.assertIn("phone", r.reason)
+        self.assertEqual(self.ats.posts(), 0)
+        self.assertIs(self.store.get(app).state, State.APPROVED)
+
+    def test_a_real_number_is_still_an_answer(self):
+        """The control: bool is an int subclass, so refusing it must not refuse
+        7 years of experience along with it."""
+        page = read_back(self.ats.url("normal"))
+        pf = preflight(page, full_packet(fields={"email": 7}))
+        self.assertIs(pf.verdict, Verdict.OK, pf.reason)
+        self.assertEqual(full_packet(fields={"phone": 7}).wire()["phone"], "7")
+
+
+# --------------------------------------------------------------------------- #
 class CouldNotLookIsNotNothingThere(unittest.TestCase):
     def test_an_unreadable_side_returns_none_not_an_empty_set(self):
         self.assertIsNone(confirm_signals(None, "after"))
@@ -404,6 +669,110 @@ class AUrlNeverVerifies(ATSCase):
                    record_url_template=self.ats.base + "/records/NOPE-{ref}")
         self.assertIs(r.outcome, Outcome.UNVERIFIED)
         self.assertFalse(r.record.ok)
+
+
+# --------------------------------------------------------------------------- #
+class TheRecordProbeMatchesValuesNotSubstrings(ATSCase):
+    """`probe in blob` is a substring test against the whole page, and /drops is
+    the route that exists to catch a silently-dropped field.
+
+    Proven before the fix, on that route: a phone of "415-555-0142" was caught,
+    but a phone of "no" came back VERIFIED (it is inside "Northwind" in the
+    footer) and a phone of "1" came back VERIFIED (it is inside the reference
+    code AB-1001). Neither value was stored. VERIFIED is terminal, so a dropped
+    yes/no, initial or work-authorization answer became a permanent lie in the
+    ledger.
+    """
+
+    def _submit_with_phone(self, phone):
+        app = self.approved("drops")
+        r = submit(self.store, app, full_packet(fields={"phone": phone}),
+                   record_url_template=self.ats.record_url_template())
+        return app, r
+
+    def test_a_short_value_is_not_verified_by_a_word_that_contains_it(self):
+        app, r = self._submit_with_phone("no")       # inside "Northwind"
+        self.assertIsNone(self.ats.record(r.reference).get("phone"),
+                          "the fixture stopped dropping the phone")
+        self.assertIs(r.outcome, Outcome.UNVERIFIED, r.reason)
+        self.assertEqual(r.record.missing, ("phone",))
+        self.assertIs(self.store.get(app).state, State.SUBMITTED_UNVERIFIED)
+        self.assertFalse(is_done(self.store.get(app)),
+                         "a value the employer never stored was recorded as done")
+
+    def test_a_digit_is_not_verified_by_a_reference_code_containing_it(self):
+        app, r = self._submit_with_phone("1")        # inside "AB-1001"
+        self.assertIs(r.outcome, Outcome.UNVERIFIED, r.reason)
+        self.assertEqual(r.record.missing, ("phone",))
+        self.assertFalse(is_done(self.store.get(app)))
+
+    def test_a_short_value_must_sit_next_to_its_own_field_name(self):
+        """A standalone "yes" somewhere on the page is not evidence that THIS
+        field holds it. Here the field is on the record and EMPTY, and the word
+        appears far away, in prose about something else."""
+        far = ("We consider every application on its merits and retain records "
+               "for twenty-four months in line with the applicant privacy policy "
+               "published on our careers site. ")     # > the scoping window
+        self.assertGreater(len(far), 120)
+        page = ("<p>Application AB-2002</p>"
+                "<table><tr><td>work_authorization</td><td></td></tr></table>"
+                f"<p>{far}</p>"
+                "<p>Do we sponsor applicants from outside the US? yes</p>")
+        rc = apply.verify_record(
+            "http://127.0.0.1:1/records/AB-2002",
+            ApplyPacket(fields={"work_authorization": "yes"},
+                        applicant_name=NAME, applicant_email=EMAIL),
+            fetch=lambda u, data=None: apply.Fetched(url=u, status=200, body=page))
+        self.assertFalse(rc.ok, rc.reason)
+        self.assertEqual(rc.missing, ("work_authorization",))
+
+    def test_the_same_value_next_to_its_field_name_does_verify(self):
+        """The other half of the rule, or the one above would pass by refusing
+        everything."""
+        page = ("<p>Application AB-2002</p>"
+                "<table><tr><td>work_authorization</td><td>yes</td></tr></table>")
+        rc = apply.verify_record(
+            "http://127.0.0.1:1/records/AB-2002",
+            ApplyPacket(fields={"work_authorization": "yes"},
+                        applicant_name=NAME, applicant_email=EMAIL),
+            fetch=lambda u, data=None: apply.Fetched(url=u, status=200, body=page))
+        self.assertTrue(rc.ok, rc.reason)
+
+    def test_a_record_with_nothing_of_ours_to_check_refuses(self):
+        """Vacuous pass: every field was blank, deferred or the employer's own
+        machinery, so the probe checked nothing -- and returned ok=True on any
+        page that loaded. A check that could not run is a refusal."""
+        packet = ApplyPacket(fields={"tracking_id": "t-88", "csrf": "abc123",
+                                     "phone": "", "note": NEEDS_HUMAN},
+                             applicant_name=NAME, applicant_email=EMAIL)
+        rc = apply.verify_record(self.ats.url("thank-you"), packet)
+        self.assertFalse(rc.ok, "an empty check reported the record as good")
+        self.assertIn("nothing", rc.reason)
+
+    def test_a_record_that_really_carries_everything_still_verifies(self):
+        """The control. A probe that refuses everything is not a check either --
+        this route stores every field and hands back a reference, so it must
+        come out VERIFIED on the record read, not on the page text."""
+        app = self.approved("iframe")
+        r = submit(self.store, app, full_packet(),
+                   record_url_template=self.ats.record_url_template())
+        self.assertIs(r.outcome, Outcome.VERIFIED, r.reason)
+        self.assertTrue(r.record.ok, r.record.reason)
+        self.assertEqual(r.record.missing, ())
+        self.assertIs(self.store.get(app).state, State.SUBMITTED_VERIFIED)
+
+    def test_a_long_value_truncated_by_the_record_view_still_matches(self):
+        """Record views truncate free text, so a long value is matched on its
+        head. The token rule must not quietly undo that by demanding a boundary
+        after a word we sliced in half ourselves."""
+        shown = RESUME[:80] + "..."
+        page = (f"<table><tr><td>resume_text</td><td>{shown}</td></tr></table>")
+        rc = apply.verify_record(
+            "http://127.0.0.1:1/records/AB-2003",
+            ApplyPacket(fields={"resume_text": RESUME},
+                        applicant_name=NAME, applicant_email=EMAIL),
+            fetch=lambda u, data=None: apply.Fetched(url=u, status=200, body=page))
+        self.assertTrue(rc.ok, rc.reason)
 
 
 # --------------------------------------------------------------------------- #
