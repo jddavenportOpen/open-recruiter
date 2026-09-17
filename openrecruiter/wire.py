@@ -94,6 +94,16 @@ def claude_call(prompt: str, *, timeout: float = CALL_TIMEOUT,
                     text_parts.append(block.get("text", ""))
 
     text = "\n".join(p for p in text_parts if p).strip()
+    # The CLI prints its sign-in notice as ORDINARY CONTENT and exits 0, so a
+    # logged-out user does not get an error -- they get prose where JSON should
+    # be, and the next layer reports "no JSON object in the reply". Name the real
+    # problem here instead of letting it surface three frames away.
+    low = text.lower()
+    if "not logged in" in low or "please run /login" in low:
+        raise ModelUnavailable(
+            "you are not signed in to Claude Code. Run `claude` once, sign in, "
+            "then re-run this. (OpenRecruiter spends YOUR subscription through "
+            "the official binary and never touches your token.)")
     if not text:
         # An empty answer and a refused one look identical downstream, and one of
         # them would be recorded as "this resume did not clear the bar".
@@ -115,22 +125,51 @@ def _subprocess_runner(prompt: str, timeout: float) -> str:
 def _json_from(text: str) -> object:
     """Pull one JSON object out of a model reply, tolerating prose around it.
 
+    Uses raw_decode from the first brace rather than slicing first-brace to
+    last-brace: a reply that contains an example object followed by the real one
+    (or any prose containing braces) makes that slice span two objects, and
+    json.loads reports "Extra data" on a reply that was perfectly usable. Seen on
+    the first real model call this code ever made.
+
     A parse failure raises rather than returning a default. The grader's whole
     value is that a score it could not read becomes a refusal instead of a
     guessed number.
     """
     t = text.strip()
-    if t.startswith("```"):
-        t = t.split("```")[1] if "```" in t[3:] else t.strip("`")
-        t = t.split("\n", 1)[1] if t.lower().startswith("json") else t
-    start = t.find("{")
-    end = t.rfind("}")
-    if start < 0 or end <= start:
-        raise ModelUnavailable(f"no JSON object in the reply: {text[:160]!r}")
-    try:
-        return json.loads(t[start:end + 1])
-    except ValueError as e:
-        raise ModelUnavailable(f"unparseable JSON in the reply: {e}") from None
+    if "```" in t:
+        # Prefer a fenced block when there is one; that is where models put the
+        # answer when they have also written commentary.
+        parts = t.split("```")
+        for chunk in parts[1::2]:
+            chunk = chunk.split("\n", 1)[1] if chunk.lower().startswith("json") else chunk
+            try:
+                return json.loads(chunk.strip())
+            except ValueError:
+                continue
+
+    dec = json.JSONDecoder()
+    best, err, i = None, None, 0
+    while i < len(t):
+        if t[i] != "{":
+            i += 1
+            continue
+        try:
+            obj, end = dec.raw_decode(t[i:])
+        except ValueError as e:
+            err = e
+            i += 1
+            continue
+        if isinstance(obj, dict):
+            # The LAST TOP-LEVEL object wins: when a prompt echoes its own schema
+            # example, the real answer comes after it. Advancing past the decoded
+            # span is what keeps this top-level -- re-entering it would find the
+            # nested braces and return an inner fragment instead of the answer.
+            best = obj
+        i += end
+    if best is not None:
+        return best
+    raise ModelUnavailable(
+        f"no usable JSON object in the reply ({err}): {text[:200]!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -210,9 +249,19 @@ def build_resume(app: store_mod.Application, bank: dict, posting_text: str,
                 "weakest": "layout", "weakest_reason": f"page gate: {', '.join(codes)}",
                 "claims": list(sel.get("claims") or []), "resume_path": pdf}
 
-    rt = parse_check.check(pdf, resume)
+    # parse_check's contract is {companies, email, phone, source_text} -- NOT the
+    # resume mapping. Passing the wrong shape meant the gate fell back to its
+    # generic "did any text come out" heuristic and never checked the thing that
+    # actually matters: that the contact line and every employer survived.
+    contact = bank.get("contact") or {}
+    rt = parse_check.check(pdf, {
+        "companies": [j.get("company", "") for j in resume.get("jobs") or []],
+        "email": contact.get("email", ""),
+        "phone": contact.get("phone", ""),
+        "source_text": _plain(resume),
+    })
     if not (rt.get("passed") if isinstance(rt, dict) else bool(rt)):
-        detail = rt.get("detail", "the rendered PDF did not read back") if isinstance(rt, dict) else ""
+        detail = "; ".join(rt.get("violations") or []) or "the rendered PDF did not read back"
         return {"passed": False, "score": 0.0, "raw_score": 0.0,
                 "weakest": "machine_readability", "weakest_reason": detail,
                 "claims": list(sel.get("claims") or []), "resume_path": pdf}
@@ -255,6 +304,14 @@ def _assemble(bank: dict, sel: dict) -> dict:
     A selection naming something the bank does not contain is dropped, not
     fabricated: the model's job was to choose, and anything it returns that is
     not in the bank is by definition something it made up.
+
+    The field lookups below are tolerant on purpose. `intake` emits the name
+    under `contact.name`, education as `education_raw`, and `skills_pool` as a
+    dict; a hand-written bank tends to put the name at the top level, education
+    under `education`, and skills as a list. Reading only one of those shapes is
+    how this produced a resume with NO NAME AND NO EDUCATION from a real intake
+    bank while every test stayed green -- the tests fed it a fixture shaped to
+    its own expectations instead of to intake's actual output.
     """
     by_id = {j.get("id"): j for j in (bank.get("jobs") or [])}
     jobs = []
@@ -263,24 +320,39 @@ def _assemble(bank: dict, sel: dict) -> dict:
         if not src:
             continue
         pool = src.get("bullets") or {}
-        chosen = [pool[b] for b in (want.get("bullet_ids") or []) if b in pool]
+        if isinstance(pool, dict):
+            chosen = [pool[b] for b in (want.get("bullet_ids") or []) if b in pool]
+        else:
+            chosen = [b for b in pool if b in set(want.get("bullet_ids") or [])] or list(pool)
         if not chosen:
             continue
         jobs.append({"company": src.get("company", ""), "title": src.get("title", ""),
                      "location": src.get("location", ""), "dates": src.get("dates", ""),
                      "bullets": chosen})
-    summaries = bank.get("summaries") or {}
+
     contact = bank.get("contact") or {}
-    pool = bank.get("skills_pool") or []
-    allowed = set(pool if isinstance(pool, list) else [])
+    name = bank.get("name") or contact.get("name") or ""
+    summaries = bank.get("summaries") or {}
+    education = bank.get("education") or bank.get("education_raw") or []
+
+    pool = bank.get("skills_pool") or bank.get("skills") or []
+    flat = []
+    if isinstance(pool, dict):
+        for v in pool.values():
+            flat.extend(v if isinstance(v, (list, tuple)) else [v])
+    else:
+        flat = list(pool)
+    allowed = {str(x) for x in flat}
+    picked = [s for s in (sel.get("skills") or []) if not allowed or s in allowed]
+
     return {
-        "name": bank.get("name", ""),
+        "name": name,
         "contact": " | ".join(x for x in [contact.get("email"), contact.get("phone"),
                                           contact.get("location")] if x),
         "summary": summaries.get(sel.get("summary_key")) or next(iter(summaries.values()), ""),
         "jobs": jobs,
-        "education": bank.get("education") or [],
-        "skills": [s for s in (sel.get("skills") or []) if not allowed or s in allowed] or pool,
+        "education": education,
+        "skills": picked or flat,
     }
 
 

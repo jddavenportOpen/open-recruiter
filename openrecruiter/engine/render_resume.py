@@ -192,6 +192,17 @@ def _render(resume: dict, out_path: str, _subs: dict) -> dict:
     if resume.get("education"):
         c.section("Education")
         for e in resume["education"]:
+            # A plain string is a legitimate entry. `intake` keeps an education
+            # line verbatim when it cannot honestly split it into school/degree/
+            # dates -- refusing to guess is the correct behaviour there, and this
+            # renderer used to crash on the result with an AttributeError deep in
+            # the typesetter, which reads as "the PDF engine is broken" rather
+            # than "your education line was not decomposed".
+            if isinstance(e, str):
+                c.need(BODY_SIZE * 2)
+                c.para(e, BODY_SIZE, "regular", "school", width=TEXT_W)
+                c.space(2.2)
+                continue
             c.need(BODY_SIZE * 2)
             extra = c.row(e.get("school", ""), e.get("dates", ""), BODY_SIZE,
                           "bold", "regular", "school", "dates")
