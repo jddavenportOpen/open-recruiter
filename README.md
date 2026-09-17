@@ -143,14 +143,22 @@ Pick either, or run both.
 export TELEGRAM_BOT_TOKEN=...   TELEGRAM_CHAT_ID=...
 ```
 
-**SendBlue** — their sandbox is **$0 and needs no credit card**, and
-`--phone` auto-verifies your own number, which is the only contact a personal
-recruiter needs:
+**SendBlue** — a real iMessage/SMS thread on your own number. Their sandbox is
+**$0 and needs no credit card**, and `--phone` auto-verifies your own number,
+which is the only contact a personal recruiter needs:
 ```bash
-npm i -g @sendblue/cli && sendblue setup --phone +1XXXXXXXXXX
-export SENDBLUE_API_API_KEY=... SENDBLUE_API_API_SECRET=...
-export SENDBLUE_FROM_NUMBER=+1... SENDBLUE_TO_NUMBER=+1...
+npm i -g @sendblue/cli
+sendblue setup --phone +1XXXXXXXXXX      # texts you a code; that is the whole signup
+export SENDBLUE_API_API_KEY=...  SENDBLUE_API_API_SECRET=...
+export SENDBLUE_FROM_NUMBER=+1...        # the number Sendblue gave you
+export SENDBLUE_TO_NUMBER=+1...          # your own phone
 ```
+
+You approve by replying **`Y`** or **`N`** to the card. Not by a thumbs-up — see
+*A note on tapbacks* above. And because it is unresolved whether the free tier may
+message a contact who has not written first, a session is **yours to start**: text
+the agent `go` and it replies with the top of your queue. That also means it
+cannot page you at 3am.
 
 **Your credentials stay on your machine.** We never proxy them, never hold them,
 and there is no account with us.

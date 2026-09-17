@@ -121,7 +121,7 @@ class SendBlueChannel(Channel):
         """Flip the card in place ("submitted, confirmation verified") instead of
         sending a second message the user has to reconcile with the first."""
         try:
-            self._call(f"/api/messages/{card_id}/app-card", {"content": text}, method="PUT")
+            self._call(f"/api/messages/{card_id}/update-app-card", {"content": text})
             return True
         except Exception:
             return False
@@ -129,9 +129,15 @@ class SendBlueChannel(Channel):
     def acknowledge(self, message_id: str) -> bool:
         """Tapback the USER's inbound reply as an instant read receipt.
 
-        This is the direction SendBlue supports: inbound targets are accepted,
-        outbound targets return 422. Failure is non-fatal -- an approval that was
-        received but not acknowledged must still count.
+        Inbound is the direction SendBlue supports -- an outbound target returns
+        422. But the reaction endpoint is documented on their docs site and does
+        NOT appear in the published SDK's endpoint list, so the path here is not
+        verified against a live account.
+
+        That is why this fails SOFT and returns False rather than raising: a read
+        receipt is a courtesy, and an approval that arrived but could not be
+        acknowledged must still count as an approval. Never make the decision
+        depend on this.
         """
         try:
             self._call("/api/send-reaction",
@@ -143,7 +149,12 @@ class SendBlueChannel(Channel):
     def poll_inbound(self, since: float | None = None):
         cursor = since if since is not None else self._cursor
         try:
-            r = self._call("/api/messages?limit=25", method="GET")
+            # GET /api/v2/messages -- note the v2. The send path is NOT versioned
+            # (POST /api/send-message) and the read path is, which is easy to get
+            # wrong from an overview page. It was wrong here: this polled
+            # /api/messages, so an inbound "Y" was never seen and the approval
+            # loop would have waited out its full timeout on every application.
+            r = self._call("/api/v2/messages?limit=25", method="GET")
         except Exception:
             return []
         out = []
