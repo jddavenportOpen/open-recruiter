@@ -12,22 +12,30 @@ for that costs money.
 
 ---
 
-## Status: early. Read this before you fork.
+## Status: it runs end to end. Read this before you fork.
 
-**What works today** — the verification engine and the approval rail:
+    import|intake  →  setup  →  scan  →  run  →  outcomes
 
 - the zero-dependency PDF stack (typeset → measure the rendered page → read the
   text back out and diff it)
 - the three-persona panel and the tiered pass/fail gate
-- the channel layer: Telegram and SendBlue adapters behind one interface
-- 55 invariant tests, plus a mutation harness that proves they are not decoration
+- job discovery across Greenhouse, Lever and Ashby, with caching and backoff
+- the one-at-a-time work loop, paced against your real Claude usage
+- Telegram and SendBlue adapters behind one channel interface
+- a localhost dashboard, and outcomes recorded **by code**
+- 595 tests, plus a mutation harness that proves they are not decoration
 
-**What is not built yet**: the intake interview, the job scout, the work loop,
-the apply path, the dashboard, and outcome tracking. The roadmap is real work,
-not a wish list — see [WORKPLAN](#roadmap) below.
+Measured on a real run: **1,549 postings** pulled from live boards, and a resume
+built from a real 113-bullet bank through both gates and three judges in ~2 min.
+
+**What is weak**: intake on styled PDFs — see **Known limits**. Use `import` if
+you already have a structured bank.
+
+**What is off by default**: submission to real employers. The apply path runs
+against a local mock ATS until you set `OPENRECRUITER_ALLOW_REAL_SUBMIT=1`.
 
 **We make no claim that this improves your callback rate.** We have one honest
-baseline and it is not flattering (below), and nothing in this repo will pretend
+baseline and it is not flattering (below), and nothing here will pretend
 otherwise until there is outcome data to look at.
 
 ---
@@ -200,13 +208,15 @@ rather than borrowing anyone else's numbers.
 | | |
 |---|---|
 | ✅ | verification engine, channel layer, invariant + mutation suite |
-| ◻ | experience bank from resumes you already have, with per-file extraction confidence |
-| ◻ | the intake interview → a proposed pipeline you edit and confirm |
-| ◻ | the one-at-a-time work loop, paced against your actual Claude quota |
-| ◻ | the conversational surface — ask it why, refine goals by text, dictate an essay |
-| ◻ | apply + read the confirmation back ("we clicked submit" is not "we sent it") |
-| ◻ | a localhost dashboard the agent keeps current |
-| ◻ | outcomes recorded **by code**, so "does the score predict anything?" becomes answerable |
+| ✅ | experience bank, with per-file extraction confidence and conflict detection |
+| ✅ | the intake interview → a proposed pipeline you edit and confirm |
+| ✅ | the one-at-a-time work loop, paced against your actual Claude quota |
+| ✅ | apply + read the confirmation back, verified against a local mock ATS |
+| ✅ | a localhost dashboard, token-gated and loopback-only |
+| ✅ | outcomes recorded **by code**, so "does the score predict anything?" becomes answerable |
+| ◻ | intake that survives a two-column PDF |
+| ◻ | the conversational surface — refine goals by text, dictate an essay |
+| ◻ | a verified submit to a real employer |
 
 ---
 
