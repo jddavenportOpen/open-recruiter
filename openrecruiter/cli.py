@@ -219,8 +219,14 @@ def run(args) -> int:
     from openrecruiter.loop import run_forever, run_once
     store = S.Store()
     bank = wire.load_bank()
-    deps = wire.build_deps(store, bank)
-    print(f"\nrunning. stop with: touch {os.path.join(wire.home(), 'STOP')}\n")
+    # A 24-hour approval window is right for a runner you leave up, and wrong for
+    # the first thing a new user types: a rail that can send but not receive is
+    # indistinguishable from a human who has not answered yet, and they would
+    # wait a day to find out. --once therefore waits minutes and says so.
+    timeout = args.timeout_min * 60.0 if args.timeout_min else (900.0 if args.once else 86400.0)
+    deps = wire.build_deps(store, bank, approval_timeout_s=timeout)
+    print(f"\nrunning. stop with: touch {os.path.join(wire.home(), 'STOP')}")
+    print(f"approval window: {timeout/60:.0f} min\n")
     if args.once:
         print(run_once(store, deps))
         return 0
@@ -335,6 +341,8 @@ def main(argv=None) -> int:
 
     p_run = sub.add_parser("run", help="work the queue, one application at a time")
     p_run.add_argument("--once", action="store_true", help="a single cycle, then stop")
+    p_run.add_argument("--timeout-min", type=float, default=None,
+                       help="minutes to wait for your answer (default 15 with --once)")
     p_run.set_defaults(fn=run)
 
     p_out = sub.add_parser("outcomes", help="what happened, and whether the score predicted it")

@@ -371,7 +371,7 @@ def _plain(resume: dict) -> str:
 # --------------------------------------------------------------------------- #
 # ask: one card, one decision, on whichever rails are configured               #
 # --------------------------------------------------------------------------- #
-def make_ask(channels, *, timeout_s: float = 86400.0):
+def make_ask(channels, *, timeout_s: float = 86400.0, notify=None):
     """One application, one message, one answer.
 
     Sends on every configured rail so a user with both gets the card wherever
@@ -387,16 +387,34 @@ def make_ask(channels, *, timeout_s: float = 86400.0):
                     weakest_reason=app.weakest_reason or "",
                     claims=list(app.claims or []),
                     resume_path=app.resume_path, url=app.url)
-        card_ids = []
+        card_ids, failures = [], []
         for ch in channels:
             try:
                 card_ids.append((ch, ch.send_card(card)))
-            except Exception:
-                continue                   # one dead rail must not lose the other
+            except Exception as e:
+                # One dead rail must not lose the other -- but it must not be
+                # swallowed either, or a user with two rails configured and one
+                # broken never learns which.
+                failures.append((ch.name, f"{type(e).__name__}: {e}"))
         if not card_ids:
-            raise RuntimeError("no messaging rail accepted the card")
+            # Every rail refused it. Loud, with the reasons, because the
+            # alternative is a runner that looks busy and is talking to nobody.
+            raise RuntimeError(
+                "no messaging rail accepted the card: "
+                + "; ".join(f"{n}: {e}" for n, e in failures))
         ch, cid = card_ids[0]
-        return ch.await_decision(cid, timeout_s=timeout_s)
+        if notify:
+            notify(f"card sent on {ch.name} (id {cid}); waiting up to "
+                   f"{timeout_s/60:.0f} min for your answer")
+        got = ch.await_decision(cid, timeout_s=timeout_s)
+        if notify and got is Decision.TIMEOUT:
+            # A rail that sends but cannot READ replies looks exactly like a
+            # human who ignored the card. Name the difference -- on a first run
+            # it is almost always the rail, not the human.
+            notify(f"no answer read back from {ch.name} within the window. If you "
+                   f"DID reply, that rail can send but not receive: check its "
+                   f"inbound credentials, or switch rails and re-run.")
+        return got
     return ask
 
 
@@ -508,7 +526,7 @@ def save_bank(bank: dict) -> str:
 
 
 def build_deps(store: store_mod.Store, bank: dict, *, channels=None,
-               call=claude_call, killswitch=None) -> "object":
+               call=claude_call, killswitch=None, approval_timeout_s=86400.0) -> "object":
     """Assemble the real Deps the loop runs on."""
     from .loop import Deps, KillSwitch
     state: dict = {}
@@ -525,7 +543,8 @@ def build_deps(store: store_mod.Store, bank: dict, *, channels=None,
         return build_resume(app, bank, posting, resumes, call=wrapped)
 
     return Deps(build=build,
-                ask=make_ask(chans),
+                ask=make_ask(chans, timeout_s=approval_timeout_s,
+                             notify=lambda m: print(f"[openrecruiter] {m}")),
                 submit=make_submit(store, bank),
                 quota_reader=make_quota_reader(state, probe=wrapped),
                 killswitch=killswitch or KillSwitch(os.path.join(home(), "STOP")))
