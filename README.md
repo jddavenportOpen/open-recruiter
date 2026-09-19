@@ -157,11 +157,12 @@ perfectly. If you already have a clean structured bank, use `import` instead.
 | ✅ | experience bank, with per-file confidence and conflict detection |
 | ✅ | intake interview, then a pipeline you edit and confirm |
 | ✅ | one-at-a-time work loop, paced against your actual Claude usage |
-| ✅ | apply, and read the confirmation back |
+| ✅ | apply and read the confirmation back, against a local mock |
 | ✅ | localhost dashboard, token gated and loopback only |
-| ✅ | outcomes recorded by code |
+| ✅ | outcomes recorded by code, so "does the score predict anything" is answerable |
 | ◻ | intake that survives a two column PDF |
 | ◻ | refine goals by text, dictate an essay |
+| ◻ | a verified submit to a real employer |
 
 ---
 
