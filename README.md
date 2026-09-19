@@ -1,185 +1,139 @@
 # OpenRecruiter
 
-*A recruiter that lives on your computer and texts your phone.*
+**A recruiter that lives on your laptop and texts your phone.**
 
-> **Not a developer?** → **[START-HERE.md](START-HERE.md)** is the plain-English
-> setup, about 15 minutes, no experience assumed. It includes a prompt you can
-> paste into Claude Code to have it do the whole thing for you.
+You drop in your history. It builds a master resume out of everything you have
+ever done, finds the jobs, writes a resume for that specific job, and puts it all
+on a dashboard so you can see where everything sits.
 
-It learns what job you want by talking to you, builds the pipelines to find those
-jobs, tailors a resume per posting, proves a machine can still read it — then
-**asks you before it applies, one application at a time.**
+Then it texts you. You say yes. It applies.
 
-Runs on your own machine, on your own Claude subscription, through your own
-messaging account. There is no server of ours in the path and nothing to sign up
-for that costs money.
+If a posting has an essay question, or anything personal, it texts you and waits.
+iMessage or Telegram, whichever you want.
 
----
+The part I like: it runs on my own machine. When something gets stuck I can just
+take over.
 
-## Status: it runs end to end. Read this before you fork.
+Free, open source, and about 3 minutes to set up.
 
-    import|intake  →  setup  →  scan  →  run  →  outcomes
-
-- the zero-dependency PDF stack (typeset → measure the rendered page → read the
-  text back out and diff it)
-- the three-persona panel and the tiered pass/fail gate
-- job discovery across Greenhouse, Lever and Ashby, with caching and backoff
-- the one-at-a-time work loop, paced against your real Claude usage
-- Telegram and SendBlue adapters behind one channel interface
-- a localhost dashboard, and outcomes recorded **by code**
-- 595 tests, plus a mutation harness that proves they are not decoration
-
-Measured on a real run: **1,549 postings** pulled from live boards, and a resume
-built from a real 113-bullet bank through both gates and three judges in ~2 min.
-
-**What is weak**: intake on styled PDFs — see **Known limits**. Use `import` if
-you already have a structured bank.
-
-**What is off by default**: submission to real employers. The apply path runs
-against a local mock ATS until you set `OPENRECRUITER_ALLOW_REAL_SUBMIT=1`.
-
-**We make no claim that this improves your callback rate.** We have one honest
-baseline and it is not flattering (below), and nothing here will pretend
-otherwise until there is outcome data to look at.
+> **Not a developer?** Read **[START-HERE.md](START-HERE.md)**. It has a prompt
+> you paste into Claude Code and it does the whole setup for you, step by step,
+> in plain language.
 
 ---
 
-## Why it does not have an "apply to everything" button
+## Setup
 
-The system this was extracted from ran the experiment already:
-
-> **55 applications in ten days → 11 rejections, 2 throttle notices, 0 interviews, 0 screens.**
-
-The detail that matters: the median time-to-rejection was ~73 hours and **none
-was under 24**. The resume was not filtered out by a keyword screen. It reached
-humans, who read it and declined. Volume was not the missing ingredient.
-
-And volume had a price. Two of the thirteen replies were throttle notices, and
-one employer — the single most important one on that list — **capped the applicant
-for 180 days after 17 submissions in four days.**
-
-Stated fairly, that is not proof that volume applying fails for everyone. A third
-of that wave went out *ungraded*, and the quality bar had already been lowered
-twice to unstick a deadlock. But combined with Greenhouse's own 640M-application
-benchmark — **applications per hire up 157.7% since 2022**, so the marginal
-application now converts at roughly 39% of its 2022 rate — the direction is clear
-enough to design against.
-
-So: **fewer, better-targeted applications, and a working record of what happened.**
-There is no volume knob, and there is no `approve-all`. A test asserts the absence.
-
----
-
-## The approval gate
-
-Every application is a separate message and a separate decision.
-
-- **Telegram** — an inline button. The callback is HMAC-signed and bound to
-  *(application, decision)*, so a tap on one application is not a valid token for
-  another.
-- **SendBlue** — a real iMessage/SMS thread on your own number. Approval is a
-  reply: **`Y`** or **`N`**.
-
-Some deliberate constraints:
-
-- **An ambiguous reply is not consent.** "yes but change the summary" re-asks. So
-  does "maybe", and so does silence.
-- **Consent is perishable.** A `Y` that arrives after the card expired is
-  re-asked, never honoured.
-- **There is no batch approval, at any tier, behind any flag.** Not `approve-all`,
-  not `auto-approve above N`. The moment a tool can approve in bulk, the careful
-  tier is one config value away from your worst instinct at 1am.
-- **Reach employers are never auto-submitted.** A standard employer is a
-  repeatable event; a reach employer is close to one-shot.
-
-The card shows the company, the role, the tier, the score, **the weakest judge's
-actual reason**, and **the specific claims the resume is asserting** — because a
-card that shows a filename and a number turns fifteen seconds of *reading* into
-one second of *clicking*.
-
-### A note on tapbacks
-
-You cannot approve by thumbs-up on SendBlue, and this is not an oversight. Their
-Reactions API accepts only *inbound* targets — a request naming an outbound
-message returns **422** — and no webhook they emit carries a reaction field. So a
-tapback on a card we sent is not observable. Reply keywords are.
-
-(A local macOS adapter that *can* read a real tapback is on the roadmap and is
-deliberately last: Full Disk Access has several silent failure modes, and the
-failure presents as a hang rather than an error.)
-
----
-
-## Install
-
-**You need Python 3.10 or newer.** macOS still ships 3.9, so on a fresh Mac:
-`brew install python@3.12` and use `python3.12` below. The tool says so plainly
-rather than failing inside an import.
+You need Python 3.10 or newer. macOS still ships 3.9, so on a fresh Mac run
+`brew install python@3.12` first and use `python3.12` below.
 
 ```bash
 git clone https://github.com/jddavenportOpen/open-recruiter.git
 cd open-recruiter
-python3 -m openrecruiter.cli doctor      # says exactly what is missing
-python3 -m openrecruiter.cli selftest    # invariant suite + mutation check, offline
+python3 -m openrecruiter.cli doctor      # tells you exactly what is missing
+python3 -m openrecruiter.cli selftest    # runs offline, takes a few seconds
 ```
 
-No install step and no dependencies beyond Python itself. The engine is
-stdlib-only by policy, so it runs in CI, in a cron job, and on a laptop you have
-not configured.
+There is no install step and no dependencies beyond Python itself. The engine is
+stdlib only, on purpose, so it runs on a laptop you have not configured.
 
-### If you already have a structured resume
+**3 minutes** is the Claude Code path in START-HERE: you paste one prompt and
+answer questions as they come. Doing it by hand is closer to 15, mostly waiting
+on the texting signup.
 
-Parsing a styled PDF back into structured history is lossy, and this tool is
-honest about that (see **Known limits**). If you already have a bank — from
-[recruit-copilot](https://github.com/jddavenportOpen/recruit-copilot), a previous
-run, or your own JSON — adopt it instead:
+### Pick a texting rail
+
+**iMessage / SMS** through SendBlue. Free sandbox, no credit card.
+
+```bash
+npm i -g @sendblue/cli
+sendblue setup --phone +1XXXXXXXXXX      # texts you a code, that is the whole signup
+export SENDBLUE_API_API_KEY=...  SENDBLUE_API_API_SECRET=...
+export SENDBLUE_FROM_NUMBER=+1...        # the number SendBlue gave you
+export SENDBLUE_TO_NUMBER=+1...          # your phone
+```
+
+**Telegram** if you prefer tappable buttons. Talk to `@BotFather`, then:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...   TELEGRAM_CHAT_ID=...
+```
+
+Your credentials stay on your machine. Nothing is proxied through a server of
+mine, and there is no account to make.
+
+### Already have a resume in structured form?
+
+Skip the PDF parsing, it is the weakest part of this (see **Known limits**):
 
 ```bash
 python3 -m openrecruiter.cli import path/to/bank.json
 ```
 
-### Messaging
+---
 
-Pick either, or run both.
+## How applying works
 
-**Telegram** — talk to `@BotFather`, then:
-```bash
-export TELEGRAM_BOT_TOKEN=...   TELEGRAM_CHAT_ID=...
-```
+Every application is one message and one decision.
 
-**SendBlue** — a real iMessage/SMS thread on your own number. Their sandbox is
-**$0 and needs no credit card**, and `--phone` auto-verifies your own number,
-which is the only contact a personal recruiter needs:
-```bash
-npm i -g @sendblue/cli
-sendblue setup --phone +1XXXXXXXXXX      # texts you a code; that is the whole signup
-export SENDBLUE_API_API_KEY=...  SENDBLUE_API_API_SECRET=...
-export SENDBLUE_FROM_NUMBER=+1...        # the number Sendblue gave you
-export SENDBLUE_TO_NUMBER=+1...          # your own phone
-```
+On iMessage you reply **`Y`** or **`N`**. On Telegram you tap a button.
 
-You approve by replying **`Y`** or **`N`** to the card. Not by a thumbs-up — see
-*A note on tapbacks* above. And because it is unresolved whether the free tier may
-message a contact who has not written first, a session is **yours to start**: text
-the agent `go` and it replies with the top of your queue. That also means it
-cannot page you at 3am.
+The card shows you the company, the role, the score, the weakest judge's actual
+reason, and the specific claims the resume is making on your behalf. That last
+one matters. A card showing a filename and a number turns fifteen seconds of
+reading into one second of clicking.
 
-**Your credentials stay on your machine.** We never proxy them, never hold them,
-and there is no account with us.
+A few things it will not do:
+
+- **An unclear answer is not a yes.** "yes but change the summary" re-asks. So
+  does "maybe", and so does silence.
+- **A late yes is not a yes.** If the card expired, it asks again.
+- **There is no approve-all**, behind any flag, at any tier. A test asserts it
+  does not exist. The moment bulk approval exists, the careful version is one
+  config line away from your worst instinct at 1am.
+- **It will not page you at 3am.** You text it `go` and it replies with the top
+  of your queue. Sessions start on your side.
+
+**Real submissions are off until you turn them on.** Out of the box the apply
+path runs against a local mock so you can watch the whole loop safely. When you
+are ready, set `OPENRECRUITER_ALLOW_REAL_SUBMIT=1`. That default is deliberate,
+so nobody fires live applications on day one by accident.
 
 ---
 
-## The self-test checks itself
+## Why there is no "apply to everything" button
 
-Most test suites in this category are decoration. The one this repo was forked
-from stayed fully green while you deleted the dimension weighting, removed the
-incomplete-panel refusal, moved the advance floor to 100, dropped the pass
-threshold to zero, and emptied the reach list.
+Because I tried that first, and it did not work.
 
-So `selftest` runs the suite **and then deliberately breaks the engine eight
-different ways and asserts the suite goes red.** A mutation that survives is
-reported as a failure, because a suite that passes while its invariant is gone is
-worse than no suite.
+> 55 applications in ten days. 11 rejections, 2 throttle notices, **0 interviews.**
+
+The detail that changed my mind: median time to rejection was about 73 hours and
+none came back under 24. The resume was not getting filtered by a keyword screen.
+It reached actual humans, who read it and passed. More volume was not the missing
+ingredient.
+
+And volume cost me something. Two of the thirteen replies were throttle notices,
+and the one employer I cared about most **capped me for 180 days after 17
+applications in four days.**
+
+Greenhouse's own numbers across 640M applications point the same way:
+applications per hire are up 157.7% since 2022, so the marginal application now
+converts at roughly 39% of its 2022 rate.
+
+So this thing is built for fewer, better-targeted applications, with a real record
+of what happened to each one. Spraying is the thing it is designed not to do.
+
+---
+
+## The tests try to break themselves
+
+Most test suites in this category are decoration. The project this was pulled out
+of stayed fully green while I deleted the scoring weights, removed a refusal,
+moved a pass threshold to zero, and emptied the reach list.
+
+So `selftest` runs the suite, then deliberately breaks the engine eight ways and
+checks the suite goes red each time. A break that survives is reported as a
+failure, because a suite that passes with its invariant gone is worse than none.
 
 ```
   [KILLED] weighting deleted
@@ -192,65 +146,66 @@ worse than no suite.
   [KILLED] boolean accepted as a score
 ```
 
-That second one was a real, shipped bug: an unbounded vote-coupling floor meant
-three "yes" votes passed the standard tier **no matter what the judges scored** —
-a resume scoring zero on every dimension came back as a pass. Anything wired to
-that verdict would have been submitting on three booleans.
+The second one was a real shipped bug. Three "yes" votes passed the standard tier
+no matter what the judges actually scored, so a resume scoring zero on every
+dimension came back a pass.
 
 ---
 
 ## Known limits
 
-**Intake on styled PDFs is weak.** Run against four real two-column resumes it
-produced seven job headers and *zero* bullets, because the bullet glyph is often
-dropped at extraction entirely. Widening the glyph set and splitting inline
-bullets helped and neither was sufficient; an indent-based heuristic was tried,
-did not move the number, and was reverted rather than left in looking useful.
-Every file still reported itself read at 100%, which is the part that stings.
+I would rather you hear these from me than find them.
 
-**The fix is free and takes one click**: export your resume as plain text
-(Google Docs → File → Download → Plain Text; Word → Save As → Plain Text) and
-hand `intake` that instead. A designed PDF is a picture of a resume with the
-text scattered around it, and the bullet glyph is frequently in a symbol font
-that extracts as nothing. A `.txt` export of the same document parses close to
-perfectly.
+**Reading styled PDFs is weak.** Against four real two column resumes it found
+seven job headers and zero bullets, because the bullet character often does not
+survive extraction at all. Worse, every file still reported itself read at 100%.
 
-Check what `intake` produces before trusting it, and prefer `import` when you
-already have a curated bank.
+The fix is free and takes one click: export your resume as plain text (Google Docs
+→ File → Download → Plain Text, or Word → Save As → Plain Text) and run `intake`
+on that instead. A designed PDF is really a picture of a resume with the text
+scattered around it. The same document as `.txt` parses almost perfectly.
 
-**No results data.** The outcome ledger starts at zero and the tool says so
-rather than borrowing anyone else's numbers.
+Check what `intake` gives you before trusting it, and use `import` if you already
+have a clean bank.
+
+**No outcome data yet.** The ledger starts empty and stays honest. I am not going
+to borrow someone else's numbers to fill it, and I make no claim that this raises
+your callback rate.
+
+**A verified submit to a real employer is still on the roadmap**, not done. Real
+submitting works and is flag gated, but I have not yet shipped the end to end
+proof of a confirmed submission read back from a real employer's ATS.
+
+---
 
 ## Roadmap
 
 | | |
 |---|---|
-| ✅ | verification engine, channel layer, invariant + mutation suite |
-| ✅ | experience bank, with per-file extraction confidence and conflict detection |
-| ✅ | the intake interview → a proposed pipeline you edit and confirm |
-| ✅ | the one-at-a-time work loop, paced against your actual Claude quota |
-| ✅ | apply + read the confirmation back, verified against a local mock ATS |
-| ✅ | a localhost dashboard, token-gated and loopback-only |
-| ✅ | outcomes recorded **by code**, so "does the score predict anything?" becomes answerable |
-| ◻ | intake that survives a two-column PDF |
-| ◻ | the conversational surface — refine goals by text, dictate an essay |
+| ✅ | verification engine, texting layer, self-breaking test suite |
+| ✅ | experience bank, with per-file confidence and conflict detection |
+| ✅ | intake interview, then a pipeline you edit and confirm |
+| ✅ | one-at-a-time work loop, paced against your actual Claude usage |
+| ✅ | apply and read the confirmation back, against a local mock |
+| ✅ | localhost dashboard, token gated and loopback only |
+| ✅ | outcomes recorded by code, so "does the score predict anything" is answerable |
+| ◻ | intake that survives a two column PDF |
+| ◻ | refine goals by text, dictate an essay |
 | ◻ | a verified submit to a real employer |
 
 ---
 
-## Prior art, and what this owes it
+## What this is built on
 
-The verification engine here is extracted from
-[recruit-copilot](https://github.com/jddavenportOpen/recruit-copilot), which
-deliberately has **no submit path at all** and argues for that position at length.
+The verification engine is pulled out of
+[recruit-copilot](https://github.com/jddavenportOpen/recruit-copilot), which has
+no submit path at all and argues that case at length.
 
-This project adds one, and it inherits that repo's conditions rather than
-inventing its own — because the argument there was never against submission, it
-was against *ungated* submission. Every constraint in "The approval gate" above
-comes from it.
+This one adds a submit path, and keeps every condition that repo put on it.
+The argument there was never against applying. It was against applying without a
+gate.
 
-Three of the four comparable open-source projects shipped in the last five months
-also refuse to press submit. That convergence is worth taking seriously.
+Clone it, fork it, steal pieces, have some fun with it.
 
 ## License
 

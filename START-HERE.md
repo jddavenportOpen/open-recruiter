@@ -1,13 +1,17 @@
 # Start here
 
-This is the plain-English setup. No experience assumed. About 15 minutes.
+This is the plain-English setup. No experience assumed.
+
+**About 3 minutes** if you use the Claude Code prompt below, since it does the
+work and just asks you questions. Closer to 15 if you do it by hand, and most
+of that is waiting on the texting signup.
 
 **What you are setting up:** a program that lives on your own computer, finds jobs
 you actually want, writes a resume for each one, and then **texts you and waits**.
 It does not apply to anything until you reply. There is no "apply to everything"
 button, on purpose.
 
-**What it costs:** nothing to us. You need a Claude subscription (Pro or Max),
+**What it costs:** nothing to me, and nothing for the tool itself. You need a Claude subscription (Pro or Max),
 which you may already have. The texting service has a free tier that does not ask
 for a card.
 
@@ -60,7 +64,7 @@ where everything below goes. Copy a line, paste it, press enter, wait.
 python3 --version
 ```
 
-If that says **3.10 or higher**, you are fine — use `python3` everywhere below.
+If that says **3.10 or higher**, you are fine, use `python3` everywhere below.
 
 If it says **3.9** (normal on a Mac), get a newer one:
 
@@ -79,7 +83,7 @@ cd open-recruiter
 python3 -m openrecruiter.cli doctor
 ```
 
-`doctor` tells you what is missing. It will complain about messaging — that is the
+`doctor` tells you what is missing. It will complain about messaging, that is the
 next step.
 
 ### 4. Set up texting
@@ -142,8 +146,8 @@ says a file was read poorly, or that it found no bullet points, believe it.
 > instead.
 >
 > A designed, two-column PDF is a picture of a resume with the text scattered
-> around it. Half the time the bullet characters are not even in the file — they
-> are in a font that comes back as nothing — and everything under a job heading
+> around it. Half the time the bullet characters are not even in the file, they
+> are in a font that comes back as nothing, and everything under a job heading
 > vanishes. A `.txt` export has none of that problem and parses close to
 > perfectly. Same words, one menu click, enormously better result.
 >
@@ -184,7 +188,7 @@ Takes two or three minutes. Then check your phone.
 
 You get one message per job, and only one at a time. It says the company, the
 role, the score, **the harshest judge's actual reason**, and the specific claims
-the resume is making on your behalf. Read that last part — it is the whole point.
+the resume is making on your behalf. Read that last part, it is the whole point.
 
 Reply **Y** to apply or **N** to skip. Or tap the button, on Telegram.
 
@@ -217,13 +221,13 @@ you an encouraging number that means nothing.
 It is designed to fail loudly rather than pretend. If something is wrong you
 should get a sentence saying what and why, not a wall of red text. If you get the
 wall of red text instead, that is a bug worth
-[reporting](https://github.com/jddavenportOpen/open-recruiter/issues) — paste the
+[reporting](https://github.com/jddavenportOpen/open-recruiter/issues), paste the
 last twenty lines.
 
 Two known ones:
 
-- **"needs Python 3.10 or newer"** — step 2 above.
-- **intake found no bullet points** — your resume is probably a designed,
+- **"needs Python 3.10 or newer"** step 2 above.
+- **intake found no bullet points** your resume is probably a designed,
   multi-column PDF. Try a plain-text or simply-formatted version, or if you
   already have a structured resume file: `python3 -m openrecruiter.cli import
   yourfile.json`.
