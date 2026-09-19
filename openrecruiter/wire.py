@@ -433,12 +433,29 @@ def make_submit(store: store_mod.Store, bank: dict, *, allow_external: bool | No
 
     def submit(app: store_mod.Application) -> dict:
         contact = bank.get("contact") or {}
+        # The resume this application was tailored for, as a real attachment.
+        # Without it the whole upload path is library code the product never
+        # reaches: every packet the loop builds would arrive at an employer with
+        # no resume on it, and a form that requires one blocks in preflight with
+        # nothing to point at. `bind_uploads` matches it to whatever the form
+        # calls its file input.
+        uploads = ()
+        if app.resume_path and os.path.isfile(app.resume_path):
+            try:
+                uploads = (apply_mod.Upload.from_path("resume", app.resume_path),)
+            except (OSError, ValueError):
+                # Unreadable or empty. Say nothing here and let preflight refuse:
+                # a form that wants a file will block, and one that does not is
+                # unaffected. Inventing a placeholder attachment is the failure
+                # mode this module exists to avoid.
+                uploads = ()
         packet = apply_mod.ApplyPacket(
             fields={"full_name": bank.get("name", ""),
                     "email": contact.get("email", ""),
                     "phone": contact.get("phone", "")},
             applicant_name=bank.get("name", ""),
-            applicant_email=contact.get("email", ""))
+            applicant_email=contact.get("email", ""),
+            uploads=uploads)
         res = apply_mod.submit(store, app.id, packet, allow_external=allow_external)
         return {"sent": getattr(res, "sent", None),
                 "verified": bool(getattr(res, "verified", False)),

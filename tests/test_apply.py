@@ -23,8 +23,11 @@ from unittest import mock
 
 from openrecruiter import apply, mock_ats
 from openrecruiter.apply import (NEEDS_HUMAN, Answer, ApplyPacket, ExternalHostRefused,
-                                 Outcome, Verdict, answer_for, confirm_signals,
-                                 confirmation_evidence, extract_reference, guard_url,
+                                 Outcome, Session, Upload, Verdict, answer_for,
+                                 bind_uploads, carried_fields, confirm_signals,
+                                 file_controls,
+                                 confirmation_evidence, encode_multipart,
+                                 extract_reference, guard_url,
                                  http_fetch, is_done, normalize, preflight, read_back,
                                  submit)
 from openrecruiter.store import State, Store
@@ -1022,6 +1025,289 @@ class TextNormalisation(unittest.TestCase):
         self.assertEqual(extract_reference({"Reference AB-1001 received"}), "AB-1001")
         self.assertIsNone(extract_reference({"thank you"}))
         self.assertIsNone(extract_reference(None))
+
+
+# --------------------------------------------------------------------------- #
+PDF_BYTES = b"%PDF-1.7\nDana O'Neil - Principal Product Manager\n%%EOF"
+
+
+def upload_packet(**over) -> ApplyPacket:
+    """The packet a form with a real file input needs."""
+    fields = {"full_name": NAME, "email": EMAIL, "phone": "415-555-0142"}
+    fields.update(over.pop("fields", {}))
+    kw = {"applicant_name": NAME, "applicant_email": EMAIL,
+          "uploads": (Upload("resume", "dana-oneil.pdf", PDF_BYTES, "application/pdf"),)}
+    kw.update(over)
+    return ApplyPacket(fields=fields, **kw)
+
+
+class APathIsNotAFile(ATSCase):
+    """A file input is the one control a committed STRING must not satisfy.
+
+    Before uploads existed, a path in `fields` read as a perfectly good answer,
+    went out urlencoded as the characters of the path, and the employer stored
+    an application with no resume on it -- behind a confirmation page that said
+    yes. That is the shape of every other bug this module refuses, so it gets
+    refused by name.
+    """
+
+    FORM = ("<form method='post'><input name='full_name' required>"
+            "<input type='file' name='resume' required></form>")
+
+    def test_a_required_file_input_with_no_upload_is_blocked(self):
+        pre = preflight(self.FORM, ApplyPacket(fields={"full_name": NAME}))
+        self.assertIs(pre.verdict, Verdict.BLOCKED)
+        self.assertTrue(any("resume" in m for m in pre.missing))
+
+    def test_a_path_string_behind_a_file_input_is_blocked_by_name(self):
+        pkt = ApplyPacket(fields={"full_name": NAME, "resume": "/Users/me/resume.pdf"})
+        pre = preflight(self.FORM, pkt)
+        self.assertIs(pre.verdict, Verdict.BLOCKED)
+        self.assertTrue(any("a path is not a file" in m for m in pre.missing),
+                        f"the refusal has to name the confusion: {pre.missing}")
+
+    def test_an_actual_upload_satisfies_the_file_input(self):
+        pre = preflight(self.FORM, upload_packet())
+        self.assertIs(pre.verdict, Verdict.OK)
+        self.assertIn("dana-oneil.pdf", pre.proof["resume"])
+
+    def test_a_file_input_that_is_not_required_does_not_block(self):
+        form = ("<form method='post'><input name='full_name' required>"
+                "<input type='file' name='portfolio'></form>")
+        self.assertIs(preflight(form, ApplyPacket(fields={"full_name": NAME})).verdict,
+                      Verdict.OK)
+
+
+class MultipartIsBuiltSafely(unittest.TestCase):
+    def test_fields_and_file_both_survive_a_round_trip(self):
+        ct, body = encode_multipart({"email": EMAIL}, [Upload("resume", "r.pdf",
+                                                              PDF_BYTES, "application/pdf")])
+        self.assertIn("multipart/form-data; boundary=", ct)
+        self.assertIn(EMAIL.encode(), body)
+        self.assertIn(PDF_BYTES, body)
+        self.assertIn(b'filename="r.pdf"', body)
+        self.assertIn(b"Content-Type: application/pdf", body)
+
+    def test_a_boundary_occurring_in_the_file_is_not_used(self):
+        """Not paranoia: a boundary inside a part truncates the body at the
+        employer's parser, and nothing raises. The resume arrives half-length.
+
+        The collision is FORCED. Comparing two randomly generated boundaries
+        proves nothing -- they differ whether or not the check exists, which is
+        how the first version of this test passed with the check deleted.
+        """
+        seq = iter(["dead", "beef"])
+        with mock.patch("openrecruiter.apply.secrets.token_hex",
+                        lambda _n: next(seq)):
+            evil = Upload("resume", "r.pdf",
+                          b"----openrecruiter-dead is inside this file")
+            ct, body = encode_multipart({}, [evil])
+        boundary = ct.split("boundary=", 1)[1]
+        self.assertEqual(boundary, "----openrecruiter-beef",
+                         "the first boundary collided and had to be abandoned")
+        self.assertNotIn(boundary.encode(), evil.content)
+        self.assertIn(evil.content, body)
+
+    def test_a_quote_or_newline_in_a_filename_cannot_close_the_header(self):
+        _, body = encode_multipart({}, [Upload("resume", 'a"b\nc.pdf', b"x")])
+        head = body.split(b"\r\n\r\n", 1)[0]
+        self.assertNotIn(b'"b', head)
+        self.assertIn(b"%22", head)
+        self.assertIn(b"%0A", head)
+
+    def test_from_path_refuses_an_empty_file(self):
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
+            with self.assertRaises(ValueError):
+                Upload.from_path("resume", f.name)
+
+    def test_from_path_reads_bytes_and_guesses_the_type(self):
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(PDF_BYTES)
+            name = f.name
+        try:
+            u = Upload.from_path("resume", name)
+            self.assertEqual(u.content, PDF_BYTES)
+            self.assertEqual(u.content_type, "application/pdf")
+            self.assertNotIn(str(PDF_BYTES[:8]), repr(u))   # never dump bytes
+        finally:
+            os.unlink(name)
+
+
+class ASessionIsScopedToOneApplication(ATSCase):
+    def test_a_cookie_set_on_the_get_is_sent_on_the_post(self):
+        sess = Session()
+        http_fetch(self.ats.url("upload"), session=sess)
+        self.assertIn("sid", sess.cookie_names())
+
+    def test_two_sessions_do_not_share_a_jar(self):
+        """A module-level jar would send one employer's session cookie to the
+        next employer on the next application."""
+        a, b = Session(), Session()
+        http_fetch(self.ats.url("upload"), session=a)
+        self.assertIn("sid", a.cookie_names())
+        self.assertEqual(b.cookie_names(), ())
+
+    def test_without_a_session_the_form_rejects_the_post(self):
+        """The failure a cookie-less client actually gets: a 200, a polite
+        sentence, and no application stored anywhere."""
+        page = http_fetch(self.ats.url("upload"))
+        posted = http_fetch(self.ats.url("upload"),
+                            {"full_name": NAME, "email": EMAIL, "phone": "1"},
+                            files=[Upload("resume", "r.pdf", PDF_BYTES)])
+        self.assertEqual(posted.status, 200)
+        self.assertIn("expired", (posted.body or "").lower())
+        self.assertEqual(self.ats.stored(), 0)
+        self.assertIsNotNone(page.body)
+
+
+class TheFormsOwnHiddenFieldsGoBack(ATSCase):
+    def test_hidden_prefilled_controls_are_carried(self):
+        got = carried_fields("<form><input type='hidden' name='csrf' value='abc'>"
+                             "<input name='full_name' value='visible'></form>")
+        self.assertEqual(got, {"csrf": "abc"})
+
+    def test_an_empty_hidden_control_is_not_invented(self):
+        self.assertEqual(carried_fields("<form><input type='hidden' name='csrf'></form>"), {})
+
+    def test_submit_lets_the_applicant_value_win_over_a_prefilled_copy(self):
+        """A page shipping a prefilled hidden copy of a field the human also
+        answered must never overwrite the human.
+
+        Asserted through `submit`, on the body that actually goes out. An
+        earlier version of this test re-implemented the merge inside the test,
+        so reversing the real merge order in `submit` left it green.
+        """
+        page = ("<form method='post'>"
+                "<input type='hidden' name='csrf' value='tok-42'>"
+                "<input type='hidden' name='email' value='stale@old.example'>"
+                "<input name='email' required><input name='full_name' required>"
+                "</form>")
+        sent = {}
+
+        def fake_fetch(u, data=None, files=None):
+            if data is None:
+                return apply.Fetched(url=u, status=200, body=page)
+            sent.update(data)
+            return apply.Fetched(url=u, status=200,
+                                 body=f"<p>Reference AB-9 received for {EMAIL}</p>")
+
+        app_id = self.approved("normal")
+        r = submit(self.store, app_id,
+                   ApplyPacket(fields={"email": EMAIL, "full_name": NAME},
+                               applicant_name=NAME, applicant_email=EMAIL),
+                   fetch=fake_fetch)
+        self.assertIs(r.outcome, Outcome.VERIFIED, r.reason)
+        self.assertEqual(sent["email"], EMAIL, "the stale hidden copy overwrote the human")
+        self.assertEqual(sent["csrf"], "tok-42", "the form's own machinery never went back")
+
+
+class TheAttachmentBindsToTheFormsOwnName(ATSCase):
+    """Forms do not agree on a name: resume, resume_file, cv, attachment.
+    Binding one attachment to one file input is the only mapping that exists;
+    two of either is a guess with a wrong answer, so it is refused instead."""
+
+    def test_one_upload_binds_to_the_one_file_input(self):
+        page = "<form><input type='file' name='cv' required></form>"
+        bound = bind_uploads(page, upload_packet())
+        self.assertEqual(bound.uploads[0].field, "cv")
+        self.assertEqual(bound.uploads[0].content, PDF_BYTES)
+
+    def test_a_matching_name_is_left_alone(self):
+        page = "<form><input type='file' name='resume' required></form>"
+        self.assertEqual(bind_uploads(page, upload_packet()).uploads[0].field, "resume")
+
+    def test_two_file_inputs_are_never_guessed_between(self):
+        page = ("<form><input type='file' name='resume' required>"
+                "<input type='file' name='cover_letter' required></form>")
+        bound = bind_uploads(page, upload_packet())
+        self.assertEqual(bound.uploads[0].field, "resume")   # untouched
+        pre = preflight(page, bound)
+        self.assertIs(pre.verdict, Verdict.BLOCKED)
+        self.assertTrue(any("cover_letter" in m for m in pre.missing))
+
+    def test_two_attachments_are_never_guessed_between(self):
+        page = "<form><input type='file' name='cv' required></form>"
+        pkt = upload_packet(uploads=(Upload("a", "a.pdf", b"a"), Upload("b", "b.pdf", b"b")))
+        self.assertEqual(tuple(u.field for u in bind_uploads(page, pkt).uploads), ("a", "b"))
+
+    def test_file_controls_lists_required_ones_first(self):
+        page = ("<form><input type='file' name='optional_portfolio'>"
+                "<input type='file' name='resume' required></form>")
+        self.assertEqual(file_controls(page)[0], "resume")
+
+    def test_binding_survives_a_submit_against_a_differently_named_input(self):
+        """The end-to-end version: the form calls it `cv`, the packet calls it
+        `resume`, and the employer still gets the bytes."""
+        page = ("<form method='post'><input name='full_name' required>"
+                "<input type='file' name='cv' required></form>")
+        sent = {}
+
+        def fake_fetch(u, data=None, files=None):
+            if data is None:
+                return apply.Fetched(url=u, status=200, body=page)
+            sent["files"] = list(files or [])
+            return apply.Fetched(url=u, status=200,
+                                 body=f"<p>Reference AB-7 received for {EMAIL}</p>")
+
+        app_id = self.approved("normal")
+        r = submit(self.store, app_id, upload_packet(fields={"full_name": NAME}),
+                   fetch=fake_fetch)
+        self.assertIs(r.outcome, Outcome.VERIFIED, r.reason)
+        self.assertEqual(sent["files"][0].field, "cv")
+        self.assertEqual(sent["files"][0].content, PDF_BYTES)
+
+
+class AResumeFileReachesTheEmployer(ATSCase):
+    """The end-to-end claim, asserted against the bytes the employer stored --
+    not against the sentence on the confirmation page."""
+
+    def test_a_file_upload_submit_verifies(self):
+        app_id = self.approved("upload")
+        r = submit(self.store, app_id, upload_packet())
+        self.assertIs(r.outcome, Outcome.VERIFIED, r.reason)
+        self.assertIs(r.state, State.SUBMITTED_VERIFIED)
+        self.assertTrue(r.reference)
+
+    def test_the_employer_stored_the_actual_bytes(self):
+        app_id = self.approved("upload")
+        r = submit(self.store, app_id, upload_packet())
+        stored = self.ats.file(r.reference)
+        self.assertIsNotNone(stored, "the employer has no file for this reference")
+        filename, blob, ctype = stored
+        self.assertEqual(filename, "dana-oneil.pdf")
+        self.assertEqual(blob, PDF_BYTES)
+        self.assertEqual(ctype, "application/pdf")
+
+    def test_the_same_form_without_a_file_never_posts(self):
+        app_id = self.approved("upload")
+        r = submit(self.store, app_id, ApplyPacket(
+            fields={"full_name": NAME, "email": EMAIL, "phone": "1"},
+            applicant_name=NAME, applicant_email=EMAIL))
+        self.assertIs(r.outcome, Outcome.BLOCKED)
+        self.assertEqual(self.ats.posts("/upload"), 0)
+        self.assertEqual(self.ats.stored(), 0)
+
+    def test_a_reach_employer_is_still_refused_with_a_file_in_hand(self):
+        """Uploads change nothing about the hard stops."""
+        app_id = self.approved("upload", company="Anthropic", tier="reach")
+        r = submit(self.store, app_id, upload_packet())
+        self.assertIs(r.outcome, Outcome.REFUSED)
+        self.assertEqual(self.ats.posts("/upload"), 0)
+
+
+class UploadsDoNotEscapeTheSandbox(unittest.TestCase):
+    def test_a_multipart_post_to_a_real_host_is_refused(self):
+        os.environ.pop("OPENRECRUITER_ALLOW_REAL_SUBMIT", None)
+        got = http_fetch("https://boards.greenhouse.io/acme/jobs/1",
+                         {"full_name": NAME},
+                         files=[Upload("resume", "r.pdf", PDF_BYTES)])
+        self.assertEqual(got.kind, "guard")
+        self.assertIsNone(got.body)
+
+    def test_a_session_does_not_widen_the_guard(self):
+        os.environ.pop("OPENRECRUITER_ALLOW_REAL_SUBMIT", None)
+        got = http_fetch("https://boards.greenhouse.io/acme/jobs/1", session=Session())
+        self.assertEqual(got.kind, "guard")
 
 
 if __name__ == "__main__":

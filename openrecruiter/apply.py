@@ -45,9 +45,13 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import http.cookiejar
 import ipaddress
+import mimetypes
 import os
+import pathlib
 import re
+import secrets
 import socket
 import urllib.error
 import urllib.parse
@@ -63,8 +67,10 @@ __all__ = [
     "SubmitResult", "Outcome", "RecordCheck",
     "ExternalHostRefused", "guard_url", "real_employer_submit_enabled",
     "http_fetch", "read_back", "html_to_text", "normalize",
+    "Upload", "Session", "encode_multipart",
     "confirm_signals", "confirmation_evidence", "extract_reference",
     "verify_record", "preflight", "submit", "is_done", "is_reach_target",
+    "carried_fields", "file_controls", "bind_uploads",
 ]
 
 USER_AGENT = "openrecruiter/0.1 (+https://github.com/jddavenportOpen/open-recruiter)"
@@ -271,6 +277,125 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_GuardedRedirectHandler)
 
 
+# --------------------------------------------------------------------------- #
+# uploads, sessions                                                            #
+# --------------------------------------------------------------------------- #
+MAX_UPLOAD_BYTES = 10_000_000
+
+
+@dataclasses.dataclass(frozen=True)
+class Upload:
+    """A real file, held as bytes, destined for a file input on the form.
+
+    Bytes and not a path, deliberately. A path is a string, and a string behind
+    a file input is the failure this type exists to make impossible: it reaches
+    the employer as the literal characters "/Users/me/resume.pdf" in a text
+    field, the form is accepted, the confirmation comes back, and the
+    application that just went out has no resume attached to it. `preflight`
+    refuses that case by name.
+    """
+    field: str
+    filename: str
+    content: bytes
+    content_type: str = "application/octet-stream"
+
+    @classmethod
+    def from_path(cls, field: str, path, *, content_type: str | None = None) -> "Upload":
+        p = pathlib.Path(path).expanduser()
+        raw = p.read_bytes()
+        if not raw:
+            raise ValueError(f"{p} is empty; an empty resume is not an attachment")
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ValueError(f"{p} is {len(raw)} bytes, over the {MAX_UPLOAD_BYTES} cap")
+        guessed = content_type or mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        return cls(field=field, filename=p.name, content=raw, content_type=guessed)
+
+    def __repr__(self) -> str:   # never dump the bytes into a log or a traceback
+        return (f"Upload(field={self.field!r}, filename={self.filename!r}, "
+                f"content_type={self.content_type!r}, bytes={len(self.content)})")
+
+
+def _quote_part(value: str) -> str:
+    """RFC 2388 names the escaping problem and ducks it; browsers percent-encode.
+
+    A filename containing a quote or a newline would otherwise close the header
+    early and let the rest of the name be read as headers of its own.
+    """
+    return value.replace("\\", "%5C").replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def encode_multipart(fields: dict, uploads) -> tuple[str, bytes]:
+    """Return (content_type, body) for a multipart/form-data POST.
+
+    The boundary is generated and then CHECKED against every byte it has to
+    separate. A boundary that occurs inside a part does not raise anything: it
+    silently truncates the body at the employer's parser, so the resume arrives
+    half-length or the fields after it vanish. Colliding by chance is
+    vanishingly unlikely; colliding because a file contains attacker-chosen
+    bytes is not, and the check costs one scan.
+    """
+    parts: list[bytes] = []
+
+    def _probe() -> bytes:
+        blob = b"".join(str(k).encode() + str(v).encode() for k, v in fields.items())
+        for u in uploads:
+            blob += u.field.encode() + u.filename.encode() + u.content
+        return blob
+
+    probe = _probe()
+    for _ in range(8):
+        boundary = "----openrecruiter-" + secrets.token_hex(16)
+        if boundary.encode() not in probe:
+            break
+    else:                                        # pragma: no cover - 8 x 2^128
+        raise RuntimeError("could not find a multipart boundary absent from the body")
+
+    dash = f"--{boundary}\r\n".encode()
+    for k, v in fields.items():
+        parts.append(dash)
+        parts.append(f'Content-Disposition: form-data; name="{_quote_part(str(k))}"\r\n\r\n'.encode())
+        parts.append(str(v).encode("utf-8"))
+        parts.append(b"\r\n")
+    for u in uploads:
+        parts.append(dash)
+        parts.append(
+            f'Content-Disposition: form-data; name="{_quote_part(u.field)}"; '
+            f'filename="{_quote_part(u.filename)}"\r\n'
+            f"Content-Type: {u.content_type}\r\n\r\n".encode())
+        parts.append(u.content)
+        parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return f"multipart/form-data; boundary={boundary}", b"".join(parts)
+
+
+class Session:
+    """One cookie jar, scoped to ONE submission.
+
+    Deliberately not module-level. A shared jar sends the session cookie an
+    employer set during the GET of its own form along to the next employer's
+    host on the next application, which is both a privacy leak and the kind of
+    cross-contamination nobody would find by reading a traceback. A jar that
+    lives and dies with a single `submit` call cannot do it.
+
+    The guarded redirect handler is first in the chain here for the same reason
+    it is in `_OPENER`: the cookie processor must never be reachable by a
+    request that skipped `guard_url`.
+    """
+
+    __slots__ = ("jar", "opener")
+
+    def __init__(self):
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            _GuardedRedirectHandler, urllib.request.HTTPCookieProcessor(self.jar))
+
+    def cookie_names(self) -> tuple[str, ...]:
+        return tuple(sorted(c.name for c in self.jar))
+
+    def __len__(self) -> int:
+        return len(self.jar)
+
+
 @dataclasses.dataclass(frozen=True)
 class Fetched:
     url: str                      # the FINAL url, after redirects
@@ -285,24 +410,40 @@ class Fetched:
 
 
 def http_fetch(url: str, data: dict | None = None, *, allow_external: bool = False,
-               timeout: float = DEFAULT_TIMEOUT) -> Fetched:
+               timeout: float = DEFAULT_TIMEOUT, files=None, session=None) -> Fetched:
     """GET, or POST when `data` is given. Never raises for a network fault.
 
     `kind` separates "the connection never opened" from "something went wrong
     after we started talking", because only the first one proves nothing was
     sent. Guessing wrong in the optimistic direction is how an application gets
     submitted twice.
+
+    `files` switches the body to multipart/form-data, which is the only encoding
+    a file input accepts. `session` supplies a cookie jar, which is how the
+    hidden token an employer stamps into its own form during the GET is still
+    valid when the POST arrives: without one, the two requests are strangers and
+    the form comes back rejected for a reason the page will not explain. Both
+    default to the old behaviour, so every existing caller is unchanged.
     """
     try:
         guard_url(url, allow_external=allow_external)
     except ExternalHostRefused as e:
         return Fetched(url=url, error=str(e), kind="guard")
 
-    body = urllib.parse.urlencode(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT})
+    uploads = list(files or [])
+    headers = {"User-Agent": USER_AGENT}
+    if uploads:
+        content_type, body = encode_multipart(data or {}, uploads)
+        headers["Content-Type"] = content_type
+    elif data is not None:
+        body = urllib.parse.urlencode(data).encode()
+    else:
+        body = None
+    req = urllib.request.Request(url, data=body, headers=headers)
     setattr(req, _ALLOW_ATTR, allow_external)
+    opener = session.opener if session is not None else _OPENER
     try:
-        with _OPENER.open(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read(MAX_BYTES + 1)
             charset = resp.headers.get_content_charset() or "utf-8"
             return Fetched(url=resp.geturl(), status=resp.status,
@@ -506,6 +647,7 @@ class Control:
     required: bool
     visible: bool
     prefilled: bool
+    value: str = ""        # what the employer's own page put in the box
 
 
 @dataclasses.dataclass(frozen=True)
@@ -544,7 +686,8 @@ class _ControlParser(HTMLParser):
         visible = not (kind == "hidden" or "hidden" in a
                        or "display:none" in style or "visibility:hidden" in style)
         self.controls.append(Control(name=name, tag=tag, kind=kind, required=required,
-                                     visible=visible, prefilled=bool(a.get("value"))))
+                                     visible=visible, prefilled=bool(a.get("value")),
+                                     value=a.get("value") or ""))
 
     handle_startendtag = handle_starttag
 
@@ -637,7 +780,8 @@ def preflight(page_state, packet: "ApplyPacket") -> Preflight:
                     name=c.name, tag=prev.tag, kind=prev.kind,
                     required=prev.required or c.required,
                     visible=prev.visible or c.visible,
-                    prefilled=prev.prefilled or c.prefilled)
+                    prefilled=prev.prefilled or c.prefilled,
+                    value=prev.value or c.value)
 
         if not merged:
             return Preflight(Verdict.BLIND,
@@ -657,6 +801,22 @@ def preflight(page_state, packet: "ApplyPacket") -> Preflight:
         fields = packet.fields if packet is not None else {}
         missing, proof = [], {}
         for c in sorted(visible_required, key=lambda c: c.name):
+            if c.kind == "file":
+                # A file input is the one control a committed STRING does not
+                # satisfy. Before uploads existed, a path in `fields` read as a
+                # perfectly good answer here, went out urlencoded as the literal
+                # characters of the path, and the employer stored an application
+                # with no resume on it -- with a confirmation page that said yes.
+                # That is the confident-wrong answer this module exists to refuse,
+                # so it is named separately from a plain absence.
+                up = packet.upload_for(c.name) if packet is not None else None
+                if up is not None:
+                    proof[c.name] = f"{up.filename} ({len(up.content)} bytes, {up.content_type})"
+                elif _committed(fields.get(c.name)):
+                    missing.append(f"{c.name} (a path is not a file; attach an Upload)")
+                else:
+                    missing.append(f"{c.name} (needs a file)")
+                continue
             v = fields.get(c.name)
             if _committed(v):
                 raw = v.value if isinstance(v, Answer) else v
@@ -683,6 +843,71 @@ def preflight(page_state, packet: "ApplyPacket") -> Preflight:
 # --------------------------------------------------------------------------- #
 # confirmation                                                                 #
 # --------------------------------------------------------------------------- #
+def carried_fields(page_state) -> dict:
+    """The hidden, already-filled controls on the employer's own form.
+
+    A browser posts these back without anyone thinking about it, and a modern
+    form is built assuming that: the CSRF token stamped into the page during the
+    GET is checked against the session cookie on the POST, and a body that omits
+    it is rejected by machinery that has no reason to explain itself. The reply
+    is a 200 with a polite sentence, which is indistinguishable from a real
+    confirmation to anything that is not reading the words.
+
+    Only hidden controls that already hold a value. A visible empty box is the
+    applicant's to fill, and this function never answers one.
+    """
+    out: dict = {}
+    try:
+        markups = (page_state.all_markup() if isinstance(page_state, PageState)
+                   else [str(page_state)] if page_state is not None else [])
+        for markup in markups:
+            p = _ControlParser()
+            p.feed(markup)
+            p.close()
+            for c in p.controls:
+                if not c.visible and c.value and c.name not in out:
+                    out[c.name] = c.value
+    except Exception:                            # noqa: BLE001 -- carrying nothing
+        return {}                                # is always safe; guessing is not
+    return out
+
+
+def file_controls(page_state) -> tuple[str, ...]:
+    """Names of the file inputs on the form, required ones first."""
+    found: dict[str, bool] = {}
+    try:
+        markups = (page_state.all_markup() if isinstance(page_state, PageState)
+                   else [str(page_state)] if page_state is not None else [])
+        for markup in markups:
+            p = _ControlParser()
+            p.feed(markup)
+            p.close()
+            for c in p.controls:
+                if c.kind == "file" and c.visible:
+                    found[c.name] = found.get(c.name, False) or c.required
+    except Exception:                            # noqa: BLE001
+        return ()
+    return tuple(sorted(found, key=lambda n: (not found[n], n)))
+
+
+def bind_uploads(page_state, packet: "ApplyPacket") -> "ApplyPacket":
+    """Point a single attachment at the single file input the form actually has.
+
+    Forms do not agree on a name: `resume`, `resume_file`, `cv`, `attachment`.
+    Binding ONE upload to ONE file control is not a guess, it is the only
+    mapping that exists. Two of either IS a guess -- which file belongs in which
+    slot is a question with a wrong answer -- so the packet is returned
+    untouched and `preflight` refuses it by the normal path.
+    """
+    if packet is None or len(packet.uploads) != 1:
+        return packet
+    controls = file_controls(page_state)
+    if len(controls) != 1 or controls[0] == packet.uploads[0].field:
+        return packet
+    bound = dataclasses.replace(packet.uploads[0], field=controls[0])
+    return dataclasses.replace(packet, uploads=(bound,))
+
+
 def _readable_text(x) -> str | None:
     if x is None:
         return None
@@ -1029,6 +1254,9 @@ class ApplyPacket:
     applicant_name: str = ""
     applicant_email: str = ""
     answers: dict = dataclasses.field(default_factory=dict)
+    # Files destined for file inputs. A tuple, not a dict, because a form is
+    # allowed to ask for two attachments under two names.
+    uploads: tuple = ()
     # Machinery the employer's own page filled in. Not ours, so a record view that
     # omits it is not a dropped field.
     unchecked_fields: frozenset = frozenset({"tracking_id", "source", "csrf",
@@ -1036,6 +1264,13 @@ class ApplyPacket:
 
     def markers(self) -> tuple[str, ...]:
         return tuple(m for m in (self.applicant_email, self.applicant_name) if m.strip())
+
+    def upload_for(self, name: str):
+        """The Upload bound to a form control, or None."""
+        for u in self.uploads:
+            if u.field == name:
+                return u
+        return None
 
     def deferred(self) -> tuple[str, ...]:
         """Fields holding something that never became an answer. Optional fields
@@ -1152,8 +1387,14 @@ def submit(store: Store, app_id: str, packet: ApplyPacket, *,
               "onto the form.",
             state=app.state)
 
-    do_fetch = fetch or (lambda u, data=None: http_fetch(
-        u, data, allow_external=allow_external, timeout=timeout))
+    # ONE session for this one application: the employer's form stamps a token
+    # into the page during the GET below and validates it on the POST, which
+    # only works if both requests carry the same cookie. It dies with this call,
+    # so nothing an employer set is ever sent to the next one.
+    session = Session()
+    do_fetch = fetch or (lambda u, data=None, files=None: http_fetch(
+        u, data, allow_external=allow_external, timeout=timeout,
+        files=files, session=session))
 
     try:
         guard_url(app.url, allow_external=allow_external)
@@ -1167,6 +1408,10 @@ def submit(store: Store, app_id: str, packet: ApplyPacket, *,
                             f"could not read the form at {app.url}: "
                             f"{before.error or 'unreadable'}", state=app.state)
 
+    # The form names its own file input; bind the one attachment to it before
+    # anything judges whether the packet satisfies the form.
+    packet = bind_uploads(before, packet)
+
     pre = preflight(before, packet)
     if not pre.ok:
         # Nothing has been sent, so the row stays APPROVED and a rebuild or a human
@@ -1175,8 +1420,20 @@ def submit(store: Store, app_id: str, packet: ApplyPacket, *,
                             f"preflight {pre.verdict.value}: {pre.reason}",
                             state=app.state, preflight=pre)
 
+    # The employer's own hidden fields go back with the body, the way a browser
+    # would send them. The applicant's committed values are applied SECOND and
+    # therefore win: a page that ships a prefilled hidden copy of a field the
+    # human also answered must never overwrite the human.
+    body = dict(carried_fields(before))
+    body.update(packet.wire())
+
     store.transition(app_id, State.SUBMITTING, note="posting the form")
-    posted = do_fetch(app.url, packet.wire())
+    # Only widen the call when there is something to widen it for, so a caller
+    # passing its own two-argument `fetch` keeps working exactly as before.
+    if packet.uploads:
+        posted = do_fetch(app.url, body, files=packet.uploads)
+    else:
+        posted = do_fetch(app.url, body)
 
     if not posted.ok:
         if posted.kind == "connect":

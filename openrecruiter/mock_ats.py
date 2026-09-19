@@ -32,10 +32,14 @@ from __future__ import annotations
 
 import argparse
 import html
+import http.cookies
 import http.server
 import itertools
+import secrets
 import threading
 import urllib.parse
+from email.parser import BytesParser
+from email.policy import default as _EMAIL_POLICY
 
 HOST = "127.0.0.1"
 BRAND = "Northwind Careers"
@@ -64,6 +68,13 @@ BASE_FIELDS = [
     ("email", "Email", "email", True),
     ("phone", "Phone", "tel", False),
     ("resume_text", "Paste your resume", "textarea", True),
+]
+
+# The /upload route asks for the resume as a FILE instead of pasted text, which
+# is what a real ATS does and what the apply path could not do until it learned
+# multipart. Everything else about the form is the same.
+UPLOAD_FIELDS = [f for f in BASE_FIELDS if f[0] != "resume_text"] + [
+    ("resume", "Resume (PDF)", "file", True),
 ]
 
 WORK_AUTH = ("work_authorization",
@@ -115,6 +126,7 @@ class _Records:
         self._lock = threading.Lock()
         self._rows: dict[str, dict] = {}
         self._tokens: dict[str, str] = {}
+        self._files: dict[str, tuple] = {}
         self._ids = itertools.count(1001)
 
     def save(self, fields: dict, *, drop: tuple[str, ...] = ()) -> str:
@@ -144,6 +156,16 @@ class _Records:
             row = self._rows.get(ref)
             return dict(row) if row else None
 
+    def note_file(self, ref: str, filename: str, blob: bytes, content_type: str) -> None:
+        with self._lock:
+            self._files[ref] = (filename, blob, content_type)
+
+    def file_for(self, ref: str):
+        """The bytes the employer actually stored. A test that asserts on this is
+        asserting the resume ARRIVED, not that a page said so."""
+        with self._lock:
+            return self._files.get(ref)
+
     def count(self) -> int:
         with self._lock:
             return len(self._rows)
@@ -166,15 +188,67 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _read_raw(self) -> bytes:
+        """The request body, read exactly once.
+
+        `do_POST` parses as urlencoded before it knows the route, so a multipart
+        route that read the socket again got an empty body and then hung waiting
+        for bytes already consumed. One read, cached, and both parsers work off
+        it.
+        """
+        if getattr(self, "_raw_body", None) is None:
+            n = int(self.headers.get("Content-Length") or 0)
+            self._raw_body = self.rfile.read(n)
+        return self._raw_body
+
     def _form_body(self) -> dict[str, str]:
-        n = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(n).decode("utf-8", "replace")
+        ctype = self.headers.get("Content-Type", "").lower()
+        if "multipart/form-data" in ctype:
+            return {}                      # not this parser's encoding
+        raw = self._read_raw().decode("utf-8", "replace")
         parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
         return {k: (v[0] if v else "") for k, v in parsed.items()}
 
     @staticmethod
     def _missing(form: dict, required) -> list[str]:
         return [f for f in required if not (form.get(f) or "").strip()]
+
+    def _multipart_body(self) -> tuple[dict, dict]:
+        """Parse a multipart POST into (text fields, files).
+
+        A real ATS gets this from its framework. Doing it by hand here is the
+        point: the suite has to prove the bytes we send are parseable by someone
+        who did not write our encoder.
+        """
+        ctype = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in ctype.lower():
+            return {}, {}
+        raw = self._read_raw()
+        head = f"Content-Type: {ctype}\r\nMIME-Version: 1.0\r\n\r\n".encode()
+        msg = BytesParser(policy=_EMAIL_POLICY).parsebytes(head + raw)
+        fields, files = {}, {}
+        if not msg.is_multipart():
+            return {}, {}
+        for part in msg.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            fname = part.get_param("filename", header="content-disposition")
+            if isinstance(name, tuple):          # RFC 2231 form
+                name = name[2]
+            if isinstance(fname, tuple):
+                fname = fname[2]
+            if not name:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            if fname:
+                files[name] = (fname, payload, part.get_content_type())
+            else:
+                fields[name] = payload.decode("utf-8", "replace")
+        return fields, files
+
+    def _cookie(self, name: str) -> str:
+        jar = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        m = jar.get(name)
+        return m.value if m else ""
 
     # -- routes --------------------------------------------------------------
     def do_GET(self):
@@ -215,6 +289,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/normal":
             return self._send(_page(f"Apply - {ROLE}", _form("/normal", BASE_FIELDS)))
+
+        if path == "/upload":
+            # Two things a urlencoded POST cannot satisfy, which is the whole
+            # reason this route exists: a session cookie the form's token is
+            # bound to, and a file input that needs actual bytes.
+            sid = secrets.token_hex(8)
+            token = self.server.new_session(sid)
+            hidden = f"<input type='hidden' name='csrf' value='{token}' required>"
+            return self._send(
+                _page(f"Apply - {ROLE}",
+                      _form("/upload", UPLOAD_FIELDS, before_fields=hidden)),
+                headers=(("Set-Cookie", f"sid={sid}; Path=/"),))
 
         if path == "/sneaky":
             # The required control sits AFTER the legal wall, which is how a human
@@ -266,6 +352,45 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "Application received",
                 f"<p>Thank you. We have logged {pretty}’s application and a "
                 f"recruiter will review it.</p>"))
+
+        if path == "/upload":
+            fields, files = self._multipart_body()
+            sid = self._cookie("sid")
+            expected = self.server.session_token(sid)
+            if not sid or not expected:
+                # What a cookie-less client gets. The page is a 200 with a human
+                # sentence on it, exactly like the real ones: nothing about the
+                # status line says the request was rejected.
+                return self._send(_page("Session expired",
+                                        "<p>Your session expired. Please reload the "
+                                        "form and try again.</p>"))
+            if fields.get("csrf") != expected:
+                return self._send(_page("Session expired",
+                                        "<p>That form is no longer valid. Please "
+                                        "reload and try again.</p>"))
+            up = files.get("resume")
+            if not up or not up[1]:
+                return self._send(_page(f"Apply - {ROLE}", _form(
+                    "/upload", UPLOAD_FIELDS,
+                    before_fields=f"<input type='hidden' name='csrf' value='{expected}' required>",
+                    error="Please complete: resume")), 200)
+            missing = self._missing(fields, [f[0] for f in UPLOAD_FIELDS
+                                             if f[3] and f[0] != "resume"])
+            if missing:
+                return self._send(_page(f"Apply - {ROLE}", _form(
+                    "/upload", UPLOAD_FIELDS,
+                    before_fields=f"<input type='hidden' name='csrf' value='{expected}' required>",
+                    error=f"Please complete: {', '.join(missing)}")), 200)
+            fname, blob, ftype = up
+            stored = dict(fields)
+            stored["resume"] = f"{fname} ({len(blob)} bytes, {ftype})"
+            ref = self.server.records.save(stored, drop=("csrf",))
+            self.server.records.note_file(ref, fname, blob, ftype)
+            return self._send(_page(
+                "Application received",
+                f"<p>Thank you. Reference <strong>{html.escape(ref)}</strong>. We "
+                f"received {html.escape(fname)} ({len(blob)} bytes) for "
+                f"{html.escape(fields.get('email',''))}.</p>"))
 
         if path == "/sneaky":
             missing = self._missing(form, required + [WORK_AUTH[0]])
@@ -340,7 +465,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return self._send(_page("Not found", "<p>No such form.</p>"), 404)
 
 
-ROUTES = ("normal", "sneaky", "iframe", "redirect", "drops", "lies", "unmarked")
+ROUTES = ("normal", "sneaky", "iframe", "redirect", "drops", "lies", "unmarked",
+          "upload")
 
 
 class _Server(http.server.ThreadingHTTPServer):
@@ -352,6 +478,17 @@ class _Server(http.server.ThreadingHTTPServer):
         self.records = _Records()
         self.hits: list[tuple[str, str]] = []
         self._hit_lock = threading.Lock()
+        self._sessions: dict[str, str] = {}
+
+    def new_session(self, sid: str) -> str:
+        token = secrets.token_hex(8)
+        with self._hit_lock:
+            self._sessions[sid] = token
+        return token
+
+    def session_token(self, sid: str) -> str:
+        with self._hit_lock:
+            return self._sessions.get(sid, "")
 
     def note(self, method: str, path: str) -> None:
         with self._hit_lock:
@@ -411,6 +548,14 @@ class MockATS:
     def posts(self, path: str | None = None) -> int:
         return sum(1 for m, p in self.hits
                    if m == "POST" and (path is None or p == path))
+
+    def file(self, ref: str):
+        """(filename, bytes, content_type) the employer stored, or None.
+
+        A test asserting on THIS is asserting the resume arrived. A test
+        asserting on the confirmation page is only asserting that a page said so.
+        """
+        return self._srv.records.file_for(ref)
 
     def record(self, ref: str) -> dict | None:
         return self._srv.records.get(ref)

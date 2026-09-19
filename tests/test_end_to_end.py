@@ -17,6 +17,7 @@ import threading
 import unittest
 
 from openrecruiter import mock_ats, store as store_mod, wire
+from openrecruiter.mock_ats import MockATS
 from openrecruiter.channels.base import Capabilities, Card, Channel, Decision
 from openrecruiter.engine import panel
 from openrecruiter.loop import Deps, KillSwitch, run_once
@@ -133,6 +134,46 @@ class EndToEnd(unittest.TestCase):
         return Deps(build=build, ask=wire.make_ask([channel]), submit=submit,
                     quota_reader=wire.make_quota_reader(state, probe=call),
                     killswitch=KillSwitch(os.path.join(self.home, "STOP")))
+
+    # -- the product actually attaches the resume -----------------------------
+    def test_make_submit_attaches_the_tailored_resume_file(self):
+        """The wiring test. `apply` gained uploads; if `wire.make_submit` does
+        not pass one, the whole path is library code the product never reaches
+        and every application still goes out with no resume on it."""
+        pdf = os.path.join(self.home, "dana-principal-pm.pdf")
+        with open(pdf, "wb") as f:
+            f.write(b"%PDF-1.7 tailored for this role %%EOF")
+        with MockATS() as ats:
+            url = ats.url("upload") + "?a=r1"
+            self.store.upsert_discovered("r1", "Northwind Systems", "Principal PM", url)
+            self.store.transition("r1", State.BUILDING)
+            self.store.transition("r1", State.AWAITING_APPROVAL, resume_path=pdf)
+            self.store.transition("r1", State.APPROVED)
+
+            res = wire.make_submit(self.store, BANK, allow_external=False)(
+                self.store.get("r1"))
+
+            self.assertIs(self.store.get("r1").state, State.SUBMITTED_VERIFIED,
+                          f"submit did not verify: {res}")
+            self.assertEqual(ats.stored(), 1)
+            stored = ats.file("AB-1001")      # first reference on a fresh server
+            self.assertIsNotNone(stored, "the employer stored no file at all")
+            filename, blob, ctype = stored
+            self.assertEqual(filename, "dana-principal-pm.pdf")
+            self.assertEqual(blob, b"%PDF-1.7 tailored for this role %%EOF")
+            self.assertEqual(ctype, "application/pdf")
+
+    def test_make_submit_without_a_built_resume_blocks_instead_of_faking_one(self):
+        with MockATS() as ats:
+            url = ats.url("upload") + "?a=r2"
+            self.store.upsert_discovered("r2", "Northwind Systems", "Principal PM", url)
+            self.store.transition("r2", State.BUILDING)
+            self.store.transition("r2", State.AWAITING_APPROVAL)
+            self.store.transition("r2", State.APPROVED)
+
+            wire.make_submit(self.store, BANK, allow_external=False)(self.store.get("r2"))
+            self.assertIs(self.store.get("r2").state, State.APPROVED)
+            self.assertEqual(ats.stored(), 0)
 
     # -- the happy path -------------------------------------------------------
     def test_a_strong_application_reaches_a_human_and_only_then_is_sent(self):

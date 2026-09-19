@@ -111,6 +111,13 @@ path runs against a local mock so you can watch the whole loop safely. When you
 are ready, set `OPENRECRUITER_ALLOW_REAL_SUBMIT=1`. That default exists so nobody
 fires live applications on day one by accident.
 
+**The resume goes as a file.** The tailored PDF is attached to whatever the form
+calls its file input, the cookie the form set while you loaded it is carried to
+the submit, and the page's own hidden fields go back with it. Those three
+together are what a plain server rendered application form needs. A form drawn
+by JavaScript is still unreadable here, and preflight refuses it rather than
+posting into the dark, so this has not submitted to a real employer yet.
+
 ---
 
 ## The tests try to break themselves
@@ -158,10 +165,12 @@ perfectly. If you already have a clean structured bank, use `import` instead.
 | ✅ | intake interview, then a pipeline you edit and confirm |
 | ✅ | one-at-a-time work loop, paced against your actual Claude usage |
 | ✅ | apply and read the confirmation back, against a local mock |
+| ✅ | resume upload, session cookies, and the form's own hidden fields |
 | ✅ | localhost dashboard, token gated and loopback only |
 | ✅ | outcomes recorded by code, so "does the score predict anything" is answerable |
 | ◻ | intake that survives a two column PDF |
 | ◻ | refine goals by text, dictate an essay |
+| ◻ | a form rendered by JavaScript, which this still cannot read |
 | ◻ | a verified submit to a real employer |
 
 ---
