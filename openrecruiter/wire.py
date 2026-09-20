@@ -25,7 +25,7 @@ import subprocess
 import time
 
 from . import apply as apply_mod
-from . import boards, quota, store as store_mod
+from . import boards, config, quota, store as store_mod
 from .channels import Card, Decision, load_channels
 from .engine import format_qa, panel, parse_check, render_resume
 
@@ -61,7 +61,7 @@ def claude_call(prompt: str, *, timeout: float = CALL_TIMEOUT,
             raise ModelUnavailable(
                 f"{CLAUDE!r} is not on PATH. OpenRecruiter runs on YOUR Claude "
                 f"subscription through the official binary -- install it, sign in, "
-                f"and re-run `openrecruiter doctor`.")
+                f"and re-run `{config.invocation()} doctor`.")
         runner = _subprocess_runner
     try:
         raw = runner(prompt, timeout)
@@ -530,7 +530,7 @@ def load_bank() -> dict:
     p = os.path.join(home(), "bank.json")
     if not os.path.exists(p):
         raise FileNotFoundError(
-            "no experience bank yet — run `openrecruiter intake <folder>` first")
+            f"no experience bank yet, run `{config.invocation()} intake <folder>` first")
     with open(p) as fh:
         return json.load(fh)
 
@@ -552,7 +552,7 @@ def build_deps(store: store_mod.Store, bank: dict, *, channels=None,
     if not chans:
         raise RuntimeError(
             "no messaging rail configured — you would have no way to approve "
-            "anything. Run `openrecruiter doctor`.")
+            f"anything. Run `{config.invocation()} doctor`.")
     resumes = os.path.join(home(), "resumes")
 
     def build(app):
@@ -581,7 +581,7 @@ def scan(store: store_mod.Store, pipeline: dict, *, client=None) -> dict:
                if r.get("ats") and r.get("token")]
     if not sources:
         return {"found": 0, "added": 0, "failures": [],
-                "note": "no boards configured — run `openrecruiter setup`"}
+                "note": f"no boards configured, run `{config.invocation()} setup`"}
 
     res = client.sweep(sources, allow_partial=True)
     added = 0

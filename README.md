@@ -69,6 +69,12 @@ export SENDBLUE_TO_NUMBER=+1...          # your phone
 export TELEGRAM_BOT_TOKEN=...   TELEGRAM_CHAT_ID=...
 ```
 
+Those last until you close the terminal. To keep them, copy `.env.example` to
+`.env` in this folder and fill it in. `doctor` reads it and tells you which file
+it loaded and how many settings came out of it. Anything you have already
+exported in a terminal wins over the file, and `doctor` says when that happens,
+so a key that looks ignored is never a silent mystery. `.env` is gitignored.
+
 Your credentials stay on your machine. Nothing is proxied through a server of
 mine, and there is no account to make.
 
@@ -79,6 +85,39 @@ Skip the PDF parsing:
 ```bash
 python3 -m openrecruiter.cli import path/to/bank.json
 ```
+
+---
+
+## Running it
+
+Four commands, in this order. Use the same interpreter you used for `doctor`
+(`python3.12` if you installed it with Homebrew). Every command prints the next
+one when it finishes.
+
+```bash
+python3 -m openrecruiter.cli intake ~/Documents/my-resumes   # read your history
+python3 -m openrecruiter.cli setup                           # eight questions, then a pipeline you edit
+python3 -m openrecruiter.cli scan                            # pull the boards
+python3 -m openrecruiter.cli run --once                      # one application, then it texts you
+```
+
+`intake` tells you what it could and could not read. Believe it: if it says a
+file parsed badly, see [One tip that will save you](#one-tip-that-will-save-you)
+below before going further. `setup` proposes a list of companies and **every
+company token in it is a guess**, so open the `pipeline.json` it names and fix
+the wrong ones, or those companies quietly find nothing.
+
+Then:
+
+```bash
+python3 -m openrecruiter.cli dashboard    # a page in your browser
+python3 -m openrecruiter.cli outcomes     # did any of this work?
+touch ~/.openrecruiter/STOP               # the brake, checked before every application
+```
+
+`outcomes` is empty until you record something with
+`outcomes --record <id> <result>`. It stays honest about that rather than
+showing an encouraging number that means nothing.
 
 ---
 

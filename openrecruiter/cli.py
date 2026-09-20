@@ -10,6 +10,13 @@ import argparse
 import os
 import sys
 
+from openrecruiter.config import ensure_home, invocation, load_dotenv
+
+
+# Filled by main() so `doctor` can report the file rather than leaving the
+# reader to infer from a missing rail that it was never read.
+_DOTENV: list = []
+
 
 def _ok(msg):
     print(f"  \033[32mok\033[0m    {msg}")
@@ -27,7 +34,23 @@ def doctor(_args) -> int:
     print("\nopenrecruiter doctor\n")
     problems = 0
 
-    print("engine")
+    print("settings")
+    env = _DOTENV[-1] if _DOTENV else load_dotenv()
+    if env.error:
+        _bad(f"{env.path} could not be read: {env.error}")
+        problems += 1
+    elif env.found:
+        _ok(f"loaded {len(env.applied)} setting(s) from {env.path}")
+        if env.already_set:
+            _warn(f"already set in this terminal, so the file was NOT used for: "
+                  f"{', '.join(env.already_set)}")
+        if env.bad_lines:
+            _warn(f"{env.path}: could not read line(s) "
+                  f"{', '.join(str(n) for n in env.bad_lines)}; expected KEY=value")
+    else:
+        _ok("no .env file (fine: settings can come from the terminal instead)")
+
+    print("\nengine")
     try:
         from openrecruiter.engine import panel, pdftext, render_resume  # noqa: F401
         _ok("stdlib engine imports (no third-party dependencies)")
@@ -72,7 +95,7 @@ def doctor(_args) -> int:
     if problems:
         print(f"{problems} blocking problem(s). Fix those and re-run.\n")
         return 1
-    print("Ready. Next: `openrecruiter selftest`\n")
+    print(f"Ready. Next: `{invocation()} selftest`\n")
     return 0
 
 
@@ -94,7 +117,7 @@ def channels(_args) -> int:
     from openrecruiter.channels import load_channels
     chans = load_channels()
     if not chans:
-        print("no channels configured — run `openrecruiter doctor`")
+        print(f"no channels configured, run `{invocation()} doctor`")
         return 1
     for c in chans:
         caps = c.capabilities
@@ -151,7 +174,7 @@ def intake(args) -> int:
         print(f"\n{len(low)} file(s) read poorly. Check them before trusting the bank:")
         for n in low:
             print(f"  - {n}")
-    print("\nNext: `openrecruiter setup`")
+    print(f"\nNext: `{invocation()} setup`")
     return 0
 
 
@@ -191,7 +214,7 @@ def setup(args) -> int:
     print(f"\nwritten to {path}")
     print("\nThis is yours to edit — add companies, fix a token, delete what you do")
     print("not want. Nothing here was chosen for you.")
-    print("Then: `openrecruiter scan`")
+    print(f"Then: `{invocation()} scan`")
     return 0
 
 
@@ -200,7 +223,7 @@ def scan(args) -> int:
     import json as _json
     path = os.path.join(wire.home(), "pipeline.json")
     if not os.path.exists(path):
-        print("no pipeline yet — run `openrecruiter setup`")
+        print(f"no pipeline yet, run `{invocation()} setup`")
         return 1
     with open(path) as fh:
         pipeline = _json.load(fh)
@@ -316,11 +339,20 @@ def import_bank(args) -> int:
         return 1
     path = wire.save_bank(bank)
     print(f"\n  imported to {path}")
-    print("\nNext: `openrecruiter setup`")
+    print(f"\nNext: `{invocation()} setup`")
     return 0
 
 
 def main(argv=None) -> int:
+    # Before argparse, and before any module that reads the environment at
+    # import time. A `.env` the reader was told to write is worth nothing if it
+    # loads after the thing that needed it.
+    _DOTENV.append(load_dotenv())
+    try:
+        ensure_home()
+    except OSError:
+        pass                    # doctor reports it; a CLI that cannot mkdir is
+                                # not a CLI that should refuse to print help
     p = argparse.ArgumentParser(prog="openrecruiter",
                                 description="A recruiter that lives on your computer.")
     sub = p.add_subparsers(dest="cmd")

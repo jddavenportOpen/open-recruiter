@@ -6,3 +6,7 @@ build/
 *.egg-info/
 workspace/
 .DS_Store
+
+# Your keys. `.env.example` is the template and IS tracked; `.env` never is.
+.env
+!.env.example

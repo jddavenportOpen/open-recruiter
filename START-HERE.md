@@ -34,8 +34,9 @@ in plain language and tell me when you need something from me.
    killed". If it does not, stop and tell me what happened.
 4. Set up my texting rail. Ask me which I want: SendBlue (a normal text thread on
    my own phone number, free sandbox, no card) or Telegram (buttons I tap, needs
-   the Telegram app). Walk me through whichever I pick, step by step, and put the
-   keys in a .env file. Re-run doctor until it is green.
+   the Telegram app). Walk me through whichever I pick, step by step, then copy
+   .env.example to .env and put the keys in there. Re-run doctor until it is
+   green, and confirm doctor says it loaded my .env.
 5. Ask me for my resume. If I have a folder of resumes, run `intake` on it and
    tell me honestly how well it read them. If it reads them badly, say so.
 6. Run `setup` and ask me the questions it asks. Then help me check the board
@@ -124,9 +125,17 @@ export TELEGRAM_CHAT_ID=the-number-you-found
 
 Run `doctor` again. It should be green.
 
-> Those `export` lines only last until you close the terminal. To keep them, put
-> them in a file called `.env` inside the `open-recruiter` folder, one per line,
-> without the word `export`.
+> Those `export` lines only last until you close the terminal. To keep them:
+>
+> ```bash
+> cp .env.example .env
+> ```
+>
+> and fill in your values in that file, one per line. `doctor` tells you which
+> file it loaded and how many settings it got out of it. If you already typed
+> `export` for something in this terminal, that wins over the file, and `doctor`
+> says so, which means a key that looks ignored is never a mystery. `.env` is
+> gitignored, so your keys cannot be committed by accident.
 
 ### 5. Give it your history
 
